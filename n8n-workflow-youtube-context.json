@@ -1,0 +1,97 @@
+{
+  "name": "MW001_YouTube_Context_via_Media_Worker",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "mw-trigger-1",
+      "name": "When clicking ‘Test workflow’",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "youtube_url",
+              "value": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "mw-set-url",
+      "name": "Set YouTube URL",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://media-worker:8000/youtube-context",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ url: $json.youtube_url, prefer_captions: true }) }}",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "mw-http-worker",
+      "name": "POST media-worker /youtube-context",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 0]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b1",
+              "name": "transcript_source",
+              "value": "={{ $json.source }}",
+              "type": "string"
+            },
+            {
+              "id": "b2",
+              "name": "transcript_text",
+              "value": "={{ $json.text }}",
+              "type": "string"
+            },
+            {
+              "id": "b3",
+              "name": "whisper_model",
+              "value": "={{ $json.whisper_model }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "mw-shape",
+      "name": "Shape for downstream LLM",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [700, 0]
+    }
+  ],
+  "connections": {
+    "When clicking ‘Test workflow’": {
+      "main": [[{ "node": "Set YouTube URL", "type": "main", "index": 0 }]]
+    },
+    "Set YouTube URL": {
+      "main": [[{ "node": "POST media-worker /youtube-context", "type": "main", "index": 0 }]]
+    },
+    "POST media-worker /youtube-context": {
+      "main": [[{ "node": "Shape for downstream LLM", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "active": false,
+  "meta": { "description": "Calls media-worker to get captions or Whisper text. Use service name media-worker on Docker network; set 10min timeout for first Whisper model download." },
+  "tags": []
+}

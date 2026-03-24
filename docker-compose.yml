@@ -1,0 +1,46 @@
+# Run from this directory: docker compose up -d --build
+# n8n calls the worker at http://media-worker:8000 (same Docker network).
+
+services:
+  media-worker:
+    build: .
+    container_name: media-worker
+    restart: unless-stopped
+    environment:
+      WHISPER_MODEL: base
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE_TYPE: int8
+      YTDLP_SUB_LANGS: "en.*,en-US.*"
+    volumes:
+      - whisper_cache:/root/.cache/huggingface
+    networks:
+      - automation
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - TZ=America/New_York
+      - GENERIC_TIMEZONE=America/New_York
+      # Set when you have a public URL (webhooks / Wait node)
+      # - N8N_HOST=n8n.example.com
+      # - N8N_PROTOCOL=https
+      # - WEBHOOK_URL=https://n8n.example.com/
+      # Point workflows at the worker (optional default for expressions)
+      - MEDIA_WORKER_URL=http://media-worker:8000
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - automation
+    depends_on:
+      - media-worker
+
+networks:
+  automation:
+
+volumes:
+  n8n_data:
+  whisper_cache:
