@@ -1,11 +1,18 @@
-# Run from this directory: docker compose up -d --build
-# n8n calls the worker at http://media-worker:8000 (same Docker network).
+# Worker only (no second n8n container):
+#   docker compose up -d --build media-worker
+#
+# Worker + bundled n8n (only if you do NOT already run n8n elsewhere):
+#   docker compose --profile with-n8n up -d --build
 
 services:
   media-worker:
     build: .
     container_name: media-worker
     restart: unless-stopped
+    # Listen on the VPS loopback so n8n (host install or another container) can reach the API.
+    # Only your server can use 127.0.0.1:8000; it is not open on the public internet.
+    ports:
+      - "127.0.0.1:8000:8000"
     environment:
       WHISPER_MODEL: base
       WHISPER_DEVICE: cpu
@@ -17,6 +24,8 @@ services:
       - automation
 
   n8n:
+    profiles:
+      - with-n8n
     image: docker.n8n.io/n8nio/n8n
     container_name: n8n
     restart: unless-stopped
@@ -25,11 +34,6 @@ services:
     environment:
       - TZ=America/New_York
       - GENERIC_TIMEZONE=America/New_York
-      # Set when you have a public URL (webhooks / Wait node)
-      # - N8N_HOST=n8n.example.com
-      # - N8N_PROTOCOL=https
-      # - WEBHOOK_URL=https://n8n.example.com/
-      # Point workflows at the worker (optional default for expressions)
       - MEDIA_WORKER_URL=http://media-worker:8000
     volumes:
       - n8n_data:/home/node/.n8n
