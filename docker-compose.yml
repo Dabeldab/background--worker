@@ -33,11 +33,8 @@ services:
     restart: unless-stopped
     ports:
       - "5678:5678"
-    environment:
-      - TZ=America/New_York
-      - GENERIC_TIMEZONE=America/New_York
-      - MEDIA_WORKER_URL=http://media-worker:8000
-      - N8N_SECURE_COOKIE=false
+    env_file:
+      - .env
     volumes:
       - n8n_data:/home/node/.n8n
     networks:
