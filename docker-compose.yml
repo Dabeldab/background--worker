@@ -5,6 +5,25 @@
 #   docker compose up -d --build media-worker
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: n8n
+      POSTGRES_DB: n8n
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - automation
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
   media-worker:
     build: .
     container_name: media-worker
@@ -37,11 +56,19 @@ services:
       - TZ=America/New_York
       - GENERIC_TIMEZONE=America/New_York
       - MEDIA_WORKER_URL=http://media-worker:8000
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=n8n
     volumes:
       - n8n_data:/home/node/.n8n
     networks:
       - automation
     depends_on:
+      postgres:
+        condition: service_healthy
       media-worker:
         condition: service_healthy
 
@@ -49,5 +76,6 @@ networks:
   automation:
 
 volumes:
+  postgres_data:
   n8n_data:
   whisper_cache:
