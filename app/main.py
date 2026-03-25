@@ -300,9 +300,20 @@ _WWM_AUDIO_MASTER = (
 _WWM_VIDEO_SHARPEN = "unsharp=5:5:0.65:3:3:0.0"
 
 
-def _filter_audio_master(in_label: str, out_label: str) -> str:
-    """Append loudnorm + limiter: in_label like '[0:a]', out_label like '[aout]'."""
-    return f"{in_label}{_WWM_AUDIO_MASTER}{out_label}"
+def _prenorm_audio(src: Path, dst: Path) -> Path:
+    """Normalize loudness in an isolated audio-only pass.
+
+    Runs loudnorm + alimiter as a standalone subprocess so the two-pass
+    loudnorm buffering never blocks a looping video input or -shortest.
+    Returns dst.
+    """
+    _run_ffmpeg([
+        "-i", str(src),
+        "-af", _WWM_AUDIO_MASTER,
+        "-c:a", "aac", "-b:a", "192k", "-vn",
+        str(dst),
+    ])
+    return dst
 
 
 @app.post("/render-audiogram")
@@ -361,16 +372,17 @@ async def render_audiogram(
                 f":colors=0xE8A838|0xE8A838:rate=30[viz]"
             )
 
-        # Split audio: one branch for viz, one for mastered AAC out (avoids double-consuming [0:a])
+        # Pre-norm audio first so loudnorm never blocks inside filter_complex.
+        # Split audio: one branch for viz, one direct to encoder (already normed).
+        normed_path = _prenorm_audio(audio_path, job_dir / "normed.aac")
         filter_complex = (
-            f"[0:a]asplit=2[a_vis][a_src];"
+            f"[0:a]asplit=2[a_vis][a_enc];"
             f"{visualizer};"
-            f"[1:v][viz]overlay=0:{_WAVE_TOP}[out];"
-            f"{_filter_audio_master('[a_src]', '[a_enc]')}"
+            f"[1:v][viz]overlay=0:{_WAVE_TOP}[out]"
         )
 
         _run_ffmpeg([
-            "-i",      str(audio_path),
+            "-i",      str(normed_path),
             "-loop",   "1",
             "-i",      str(bg_path),
             "-filter_complex", filter_complex,
@@ -531,6 +543,7 @@ def _srt_force_style(style: str = "bottom") -> str:
 def _fmt_audiogram(audio: Path, bg: Path, out: Path,
                    style: str = "waveform", preset: str = "fast") -> None:
     """Waveform/spectrum audiogram — no captions."""
+    normed = _prenorm_audio(audio, audio.parent / (audio.stem + "_normed.aac"))
     if style == "spectrum":
         viz = (f"[a_vis]showspectrum=s={_W}x{_WAVE_H}:mode=combined"
                f":slide=scroll:color=rainbow:scale=cbrt[viz]")
@@ -538,12 +551,11 @@ def _fmt_audiogram(audio: Path, bg: Path, out: Path,
         viz = (f"[a_vis]showwaves=s={_W}x{_WAVE_H}:mode=cline"
                f":colors=0xE8A838|0xE8A838:rate=30[viz]")
     fc = (
-        f"[0:a]asplit=2[a_vis][a_src];{viz};"
-        f"[1:v][viz]overlay=0:{_WAVE_TOP}[out];"
-        f"{_filter_audio_master('[a_src]', '[a_enc]')}"
+        f"[0:a]asplit=2[a_vis][a_enc];{viz};"
+        f"[1:v][viz]overlay=0:{_WAVE_TOP}[out]"
     )
     _run_ffmpeg([
-        "-i", str(audio), "-loop", "1", "-i", str(bg),
+        "-i", str(normed), "-loop", "1", "-i", str(bg),
         "-filter_complex", fc,
         "-map", "[out]", "-map", "[a_enc]",
         "-c:v", "libx264", "-preset", preset, "-crf", "22",
@@ -555,18 +567,18 @@ def _fmt_audiogram(audio: Path, bg: Path, out: Path,
 def _fmt_captioned(audio: Path, bg: Path, srt: Path, out: Path,
                    caption_style: str = "bottom", preset: str = "fast") -> None:
     """Waveform audiogram with burned-in captions."""
+    normed = _prenorm_audio(audio, audio.parent / (audio.stem + "_normed.aac"))
     force_style = _srt_force_style(caption_style)
     srt_escaped = str(srt).replace("\\", "/").replace(":", "\\:")
     viz = (f"[a_vis]showwaves=s={_W}x{_WAVE_H}:mode=cline"
            f":colors=0xE8A838|0xE8A838:rate=30[viz]")
     fc = (
-        f"[0:a]asplit=2[a_vis][a_src];{viz};"
+        f"[0:a]asplit=2[a_vis][a_enc];{viz};"
         f"[1:v][viz]overlay=0:{_WAVE_TOP}[waved];"
-        f"[waved]subtitles='{srt_escaped}':force_style='{force_style}'[out];"
-        f"{_filter_audio_master('[a_src]', '[a_enc]')}"
+        f"[waved]subtitles='{srt_escaped}':force_style='{force_style}'[out]"
     )
     _run_ffmpeg([
-        "-i", str(audio), "-loop", "1", "-i", str(bg),
+        "-i", str(normed), "-loop", "1", "-i", str(bg),
         "-filter_complex", fc,
         "-map", "[out]", "-map", "[a_enc]",
         "-c:v", "libx264", "-preset", preset, "-crf", "22",
@@ -587,14 +599,15 @@ def _fmt_slideshow(audio: Path, image_paths: list[Path], out: Path,
     if not image_paths:
         raise ValueError("slideshow requires at least one image")
 
-    duration   = _get_audio_duration(audio)
+    normed     = _prenorm_audio(audio, audio.parent / (audio.stem + "_normed.aac"))
+    duration   = _get_audio_duration(normed)
     n          = len(image_paths)
     clip_dur   = max(3.0, duration / n)   # minimum 3 s per image
     fps        = 25
     frame_cnt  = int(clip_dur * fps)
 
-    # Build inputs list: audio first, then images
-    inputs = ["-i", str(audio)]
+    # Build inputs list: normed audio first, then images
+    inputs = ["-i", str(normed)]
     for p in image_paths:
         inputs += ["-loop", "1", "-t", str(clip_dur + 0.5), "-i", str(p)]
 
@@ -651,13 +664,12 @@ def _fmt_slideshow(audio: Path, image_paths: list[Path], out: Path,
     )
     filter_complex = (
         ";".join(filter_parts)
-        + f";{video_pre_fade}{fade_chain}[vfinal];"
-        + _filter_audio_master("[0:a]", "[aenc]")
+        + f";{video_pre_fade}{fade_chain}[vfinal]"
     )
     _run_ffmpeg(
         inputs + [
             "-filter_complex", filter_complex,
-            "-map", "[vfinal]", "-map", "[aenc]",
+            "-map", "[vfinal]", "-map", "0:a",
             "-c:v", "libx264", "-preset", preset, "-crf", "22",
             "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", "-shortest",
             str(out),
@@ -672,7 +684,8 @@ def _fmt_scripture_cards(audio: Path, bg: Path, scripture: str,
     both displayed over the branded background with the waveform.
     Good for devotional / meditative episodes.
     """
-    duration = _get_audio_duration(audio)
+    normed = _prenorm_audio(audio, audio.parent / (audio.stem + "_normed.aac"))
+    duration = _get_audio_duration(normed)
 
     # Escape special chars for FFmpeg drawtext
     def esc(t: str) -> str:
@@ -694,12 +707,11 @@ def _fmt_scripture_cards(audio: Path, bg: Path, scripture: str,
     )
 
     fc = (
-        f"[0:a]asplit=2[a_vis][a_src];{viz};"
-        f"[1:v][viz]overlay=0:{_WAVE_TOP}[waved];[waved]{drawtext}[out];"
-        f"{_filter_audio_master('[a_src]', '[a_enc]')}"
+        f"[0:a]asplit=2[a_vis][a_enc];{viz};"
+        f"[1:v][viz]overlay=0:{_WAVE_TOP}[waved];[waved]{drawtext}[out]"
     )
     _run_ffmpeg([
-        "-i", str(audio), "-loop", "1", "-i", str(bg),
+        "-i", str(normed), "-loop", "1", "-i", str(bg),
         "-filter_complex", fc,
         "-map", "[out]", "-map", "[a_enc]",
         "-c:v", "libx264", "-preset", preset, "-crf", "22",
@@ -994,33 +1006,64 @@ async def render_podcast(body: PodcastRenderRequest):
 
         logger.info("job=%s host=%.1fs refl=%.1fs total=%.1fs", job_id, host_dur, refl_dur, total)
 
-        # ── Build FFmpeg inputs ───────────────────────────────────────────────
-        inputs = [
-            "-stream_loop", "-1", "-t", f"{total:.2f}", "-i", str(bg_path),   # 0: bg video
-            "-i", str(host_path),                                               # 1: host audio
-        ]
-        audio_inputs = ["[1:a]volume=1.0[host]"]
-        mix_inputs   = ["[host]"]
-        mix_count    = 1
+        # ── Pass 1: audio-only mix (re-indexed, no video, no loudnorm) ──────────
+        # Build audio inputs with sequential indices (no bg video input here).
+        audio_mix_inputs = ["-i", str(host_path)]   # 0: host
+        audio_fc_parts   = ["[0:a]volume=1.0[host]"]
+        mix_labels       = ["[host]"]
+        mix_count        = 1
+        audio_idx        = 1   # next audio input index
 
         if has_reflection:
             delay_ms = int((host_dur + body.gap_seconds) * 1000)
-            inputs  += ["-i", str(refl_path)]                                   # 2: reflection
-            audio_inputs.append(f"[2:a]adelay={delay_ms}|{delay_ms},volume=1.0[refl]")
-            mix_inputs.append("[refl]")
+            audio_mix_inputs += ["-i", str(refl_path)]   # audio_idx
+            audio_fc_parts.append(
+                f"[{audio_idx}:a]adelay={delay_ms}|{delay_ms},volume=1.0[refl]"
+            )
+            mix_labels.append("[refl]")
             mix_count += 1
+            audio_idx += 1
 
         if has_ambient:
-            inputs += ["-stream_loop", "-1", "-t", f"{total:.2f}", "-i", str(amb_path)]  # 3+: ambient
-            audio_inputs.append(
-                f"[{mix_count + 1}:a]volume={body.ambient_volume},"
+            audio_mix_inputs += [
+                "-stream_loop", "-1", "-t", f"{total:.2f}", "-i", str(amb_path)
+            ]
+            audio_fc_parts.append(
+                f"[{audio_idx}:a]volume={body.ambient_volume},"
                 f"afade=t=in:st=0:d=2,"
                 f"afade=t=out:st={fade_out_start:.2f}:d=3[amb]"
             )
-            mix_inputs.append("[amb]")
+            mix_labels.append("[amb]")
             mix_count += 1
 
-        # ── Build filter_complex ──────────────────────────────────────────────
+        if mix_count > 1:
+            audio_fc_parts.append(
+                f"{''.join(mix_labels)}amix=inputs={mix_count}:duration=longest:dropout_transition=2[amix]"
+            )
+            audio_map_label = "[amix]"
+        else:
+            audio_map_label = "[host]"
+
+        mixed_path = job_dir / "mixed.aac"
+        _run_ffmpeg(
+            audio_mix_inputs + [
+                "-filter_complex", ";".join(audio_fc_parts),
+                "-map", audio_map_label,
+                "-c:a", "aac", "-b:a", "192k", "-vn",
+                str(mixed_path),
+            ]
+        )
+
+        # ── Pass 2: normalize the mixed audio ────────────────────────────────
+        normed_path = _prenorm_audio(mixed_path, job_dir / "normed.aac")
+
+        # ── Pass 3: video render with pre-normed audio (no loudnorm in graph) ─
+        inputs = [
+            "-stream_loop", "-1", "-t", f"{total:.2f}", "-i", str(bg_path),   # 0: bg video
+            "-i", str(normed_path),                                             # 1: normed audio
+        ]
+
+        # ── Build filter_complex (video only) ────────────────────────────────
         # Video: scale bg loop to fit frame, slow Ken Burns zoom in + light sharpen
         video_filter = (
             f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
@@ -1054,23 +1097,11 @@ async def render_podcast(body: PodcastRenderRequest):
         else:
             video_chain = f"[bgvid]{fade_v}[vout]"
 
-        # Audio mix + loudness / peak safety on the full mix
-        audio_chain = ";".join(audio_inputs)
-        if mix_count > 1:
-            audio_chain += f";{''.join(mix_inputs)}amix=inputs={mix_count}:duration=longest:dropout_transition=2[aout]"
-        else:
-            audio_chain += f";[host]acopy[aout]"
-        audio_chain += f";{_filter_audio_master('[aout]', '[afinal]')}"
-
-        filter_complex = f"{video_filter};{video_chain};{audio_chain}"
-        video_map = "[vout]"
-        audio_out = "[afinal]"
-
         _run_ffmpeg(
             inputs + [
-                "-filter_complex", filter_complex,
-                "-map", video_map,
-                "-map", audio_out,
+                "-filter_complex", f"{video_filter};{video_chain}",
+                "-map", "[vout]",
+                "-map", "1:a",
                 "-c:v", "libx264", "-preset", preset, "-crf", "22",
                 "-c:a", "aac", "-b:a", "192k",
                 "-pix_fmt", "yuv420p",
@@ -1163,17 +1194,36 @@ async def render_video_clips(body: VideoClipsRenderRequest):
 
         out_path = job_dir / "clips_render.mp4"
 
+        # ── Pre-normalize audio (isolated pass keeps loudnorm out of filter_complex) ─
+        if has_ambient:
+            # Mix host + ambient first, then normalize
+            mixed_path = job_dir / "mixed.aac"
+            _run_ffmpeg([
+                "-i", str(host_path),
+                "-stream_loop", "-1", "-i", str(amb_path),
+                "-filter_complex",
+                (
+                    f"[1:a]volume={body.ambient_volume},"
+                    f"afade=t=in:st=0:d=2,"
+                    f"afade=t=out:st={fade_out_start:.2f}:d=3[amb];"
+                    f"[0:a][amb]amix=inputs=2:duration=first:dropout_transition=2[amix]"
+                ),
+                "-map", "[amix]",
+                "-c:a", "aac", "-b:a", "192k", "-vn",
+                str(mixed_path),
+            ])
+            normed_path = _prenorm_audio(mixed_path, job_dir / "normed.aac")
+        else:
+            normed_path = _prenorm_audio(host_path, job_dir / "normed.aac")
+
         # ── Build filter_complex for clip concat with crossfades ──────────────
         n = len(clip_paths)
         inputs = []
         for p in clip_paths:
             inputs += ["-i", str(p)]
-        inputs += ["-i", str(host_path)]
-        if has_ambient:
-            inputs += ["-stream_loop", "-1", "-i", str(amb_path)]
+        inputs += ["-i", str(normed_path)]   # audio at index n (pre-normed, no ambient needed)
 
-        audio_idx  = n       # host audio input index
-        amb_idx    = n + 1   # ambient input index (if present)
+        audio_idx  = n       # normed audio input index
 
         filter_parts = []
 
@@ -1201,19 +1251,9 @@ async def render_video_clips(body: VideoClipsRenderRequest):
                 )
                 prev = f"xf{i}"
 
-        # Audio: host + optional ambient, then loudness / peak safety
-        if has_ambient:
-            filter_parts.append(
-                f"[{amb_idx}:a]volume={body.ambient_volume},"
-                f"afade=t=in:st=0:d=2,"
-                f"afade=t=out:st={fade_out_start:.2f}:d=3[amb];"
-                f"[{audio_idx}:a][amb]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-            )
-            filter_parts.append(_filter_audio_master("[aout]", "[afinal]"))
-        else:
-            filter_parts.append(
-                _filter_audio_master(f"[{audio_idx}:a]", "[afinal]")
-            )
+        # Audio: pre-normed audio passed through directly (mixing/normalization
+        # already done in the dedicated pre-norm pass above).
+        filter_parts.append(f"[{audio_idx}:a]acopy[afinal]")
 
         clip_fade_out = max(0.0, host_dur - 0.45)
         filter_parts.append(
