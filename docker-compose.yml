@@ -1,16 +1,14 @@
-# Worker only (no second n8n container):
-#   docker compose up -d --build media-worker
+# Start everything:
+#   docker compose up -d --build
 #
-# Worker + bundled n8n (only if you do NOT already run n8n elsewhere):
-#   docker compose --profile with-n8n up -d --build
+# Rebuild after code changes:
+#   docker compose up -d --build media-worker
 
 services:
   media-worker:
     build: .
     container_name: media-worker
     restart: unless-stopped
-    # Listen on the VPS loopback so n8n (host install or another container) can reach the API.
-    # Only your server can use 127.0.0.1:8000; it is not open on the public internet.
     ports:
       - "127.0.0.1:8000:8000"
     environment:
@@ -22,10 +20,14 @@ services:
       - whisper_cache:/root/.cache/huggingface
     networks:
       - automation
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   n8n:
-    profiles:
-      - with-n8n
     image: docker.n8n.io/n8nio/n8n
     container_name: n8n
     restart: unless-stopped
@@ -40,7 +42,8 @@ services:
     networks:
       - automation
     depends_on:
-      - media-worker
+      media-worker:
+        condition: service_healthy
 
 networks:
   automation:
