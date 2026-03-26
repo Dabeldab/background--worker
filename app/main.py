@@ -935,8 +935,13 @@ async def render_dynamic(
 
 class PodcastRenderRequest(BaseModel):
     bg_loop_url:        str   = Field(...,  description="GCS URL of background loop video")
-    host_audio_url:     str   = Field(...,  description="GCS URL of host MP3")
-    reflection_audio_url: str = Field("",  description="GCS URL of reflection MP3 (optional)")
+    host_audio_url:     str   = Field("",   description="GCS URL of host MP3 (empty when speaker_audio used)")
+    reflection_audio_url: str = Field("",   description="GCS URL of reflection MP3 (optional)")
+    # Multi-speaker fields sent by n8n Cast TTS node
+    speaker_audio:      dict  = Field(default_factory=dict, description="SPEAKER_1..N dict from Cast TTS")
+    cast_size:          int   = Field(0,    description="Number of speakers (0 = derive from speaker_audio)")
+    run_id:             str   = Field("",   description="Episode run_id from n8n")
+    episode_title:      str   = Field("",   description="Alias for title (n8n sends episode_title)")
     ambient_music_url:  str   = Field("",  description="GCS URL or Pixabay URL of ambient music bed")
     host_duration:      float = Field(0,   description="Host audio duration in seconds (0 = auto-detect)")
     reflection_duration: float = Field(0,  description="Reflection audio duration in seconds (0 = auto-detect)")
@@ -982,10 +987,56 @@ async def render_podcast(body: PodcastRenderRequest):
         amb_path  = job_dir / "ambient.mp3"
         out_path  = job_dir / "podcast.mp4"
 
+        # Resolve effective title — n8n sends episode_title, model field is title
+        effective_title = body.title or body.episode_title
+
+        # ── Download background loop ─────────────────────────────────────────
         if not _download_file(body.bg_loop_url, bg_path):
             raise HTTPException(400, "Could not download background loop video")
-        if not _download_file(body.host_audio_url, host_path):
-            raise HTTPException(400, "Could not download host audio")
+
+        # ── Multi-speaker path: concat all speaker tracks into host.mp3 ──────
+        SPEAKER_ORDER = ["SPEAKER_1", "SPEAKER_2", "SPEAKER_3", "SPEAKER_4", "SPEAKER_GIRL"]
+        if body.speaker_audio:
+            spk_urls = [
+                body.speaker_audio[k]["full_url"]
+                for k in SPEAKER_ORDER
+                if k in body.speaker_audio and body.speaker_audio[k].get("full_url")
+            ]
+            if not spk_urls:
+                raise HTTPException(400, "speaker_audio present but no full_url entries found")
+            spk_paths = []
+            for idx, url in enumerate(spk_urls):
+                p = job_dir / f"spk_{idx}.mp3"
+                if _download_file(url, p):
+                    spk_paths.append(p)
+            if not spk_paths:
+                raise HTTPException(502, "Failed to download any speaker audio files")
+            if len(spk_paths) == 1:
+                import shutil as _sh2; _sh2.copy(str(spk_paths[0]), str(host_path))
+            else:
+                spk_inputs = []
+                for p in spk_paths:
+                    spk_inputs += ["-i", str(p)]
+                n = len(spk_paths)
+                fc = "".join(f"[{i}:a]" for i in range(n)) + f"concat=n={n}:v=0:a=1[outa]"
+                _run_ffmpeg(spk_inputs + [
+                    "-filter_complex", fc,
+                    "-map", "[outa]",
+                    "-codec:a", "libmp3lame", "-q:a", "2",
+                    str(host_path),
+                ])
+            if not host_path.exists() or host_path.stat().st_size == 0:
+                raise HTTPException(500, "Multi-speaker concat produced empty file")
+            # Reflection track already baked in — disable separate refl download
+            body = body.model_copy(update={"reflection_audio_url": ""})
+            logger.info("job=%s multi-speaker concat: %d tracks -> host.mp3", job_id, len(spk_paths))
+
+        # ── Legacy 2-track path ──────────────────────────────────────────────
+        elif body.host_audio_url:
+            if not _download_file(body.host_audio_url, host_path):
+                raise HTTPException(400, "Could not download host audio")
+        else:
+            raise HTTPException(400, "Provide either speaker_audio or host_audio_url")
 
         has_reflection = bool(body.reflection_audio_url.strip())
         has_ambient    = bool(body.ambient_music_url.strip())
@@ -1077,9 +1128,9 @@ async def render_podcast(body: PodcastRenderRequest):
             return t.replace("'", "\\'").replace(":", "\\:").replace("\\", "\\\\")
 
         overlays = []
-        if body.title:
+        if effective_title:
             overlays.append(
-                f"drawtext=text='{esc(body.title[:60])}':fontsize=52:fontcolor=0xF5F0E8:"
+                f"drawtext=text='{esc(effective_title[:60])}':fontsize=52:fontcolor=0xF5F0E8:"
                 f"x=(w-text_w)/2:y=140:"
                 f"alpha='if(lt(t,0.5),t/0.5,if(lt(t,{total-1:.1f}),1,max(0,1-(t-{total-1:.1f})/0.5)))'"
             )
