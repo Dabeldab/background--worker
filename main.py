@@ -523,6 +523,240 @@ def _mix_audio(voice_path: Path, music_path: Path, out_path: Path,
     return out_path
 
 
+def _measure_or_estimate_duration(path: Path, estimated: float = 0.0) -> float:
+    measured = _get_audio_duration(path)
+    if measured > 0:
+        return measured
+    return max(float(estimated or 0.0), 0.0)
+
+
+def _safe_turn_filename(turn_index: int, speaker_id: str, url: str) -> str:
+    speaker_slug = re.sub(r"[^a-z0-9_-]+", "_", str(speaker_id or "speaker").lower()).strip("_") or "speaker"
+    suffix = Path(url.split("?", 1)[0]).suffix or ".mp3"
+    return f"turn_{turn_index + 1:03d}_{speaker_slug}{suffix}"
+
+
+def _coerce_public_storage_url(value: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    if value.startswith("gs://"):
+        return "https://storage.googleapis.com/" + value.replace("gs://", "", 1)
+    return value
+
+
+def _coerce_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    return default
+
+
+def _coerce_float(value, default: float) -> float:
+    if value is None or value == "":
+        return float(default)
+    return float(value)
+
+
+def _ambient_filter_label(seed: str, index: int) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "", str(seed or "").lower()) or "amb"
+    return f"{slug}{index}"
+
+
+def _append_ambient_mix(
+    filter_parts: list[str],
+    dialogue_label: str,
+    ambient_input_index: int,
+    ambient_volume: float,
+    fade_out_start: float,
+    ducking: bool,
+    threshold: float,
+    ratio: float,
+    attack: float,
+    release: float,
+    makeup: float,
+) -> str:
+    filter_parts.append(
+        f"[{ambient_input_index}:a]volume={ambient_volume},"
+        f"afade=t=in:st=0:d=2,"
+        f"afade=t=out:st={fade_out_start:.2f}:d=3[amb]"
+    )
+    if ducking:
+        filter_parts.append(
+            f"[amb][{dialogue_label}]sidechaincompress="
+            f"threshold={threshold}:ratio={ratio}:attack={attack}:release={release}:makeup={makeup}"
+            f"[ambduck]"
+        )
+        filter_parts.append(
+            f"[{dialogue_label}][ambduck]amix=inputs=2:duration=longest:dropout_transition=0[amix]"
+        )
+    else:
+        filter_parts.append(
+            f"[{dialogue_label}][amb]amix=inputs=2:duration=longest:dropout_transition=0[amix]"
+        )
+    return "[amix]"
+
+
+def _append_ambient_layers_mix(
+    filter_parts: list[str],
+    dialogue_label: str,
+    current_mix_label: str,
+    ambient_layers: list[dict],
+    total_duration: float,
+) -> str:
+    mix_label = current_mix_label
+    for idx, layer in enumerate(ambient_layers):
+        input_index = int(layer["input_index"])
+        volume = max(float(layer["volume"]), 0.0)
+        ducking = bool(layer["ducking"])
+        threshold = float(layer["duck_threshold"])
+        ratio = float(layer["duck_ratio"])
+        attack = float(layer["duck_attack"])
+        release = float(layer["duck_release"])
+        makeup = float(layer["duck_makeup"])
+        fade_in = max(float(layer["fade_in"]), 0.0)
+        fade_out = max(float(layer["fade_out"]), 0.0)
+        layer_name = layer["name"]
+        base_label = _ambient_filter_label(layer_name, idx)
+        bed_label = f"{base_label}_bed"
+        duck_label = f"{base_label}_duck"
+        next_mix_label = f"{base_label}_mix"
+        filter_chain = [f"volume={volume:.4f}"]
+        if fade_in > 0:
+            filter_chain.append(f"afade=t=in:st=0:d={fade_in:.2f}")
+        if fade_out > 0:
+            fade_out_start = max(0.0, total_duration - fade_out)
+            filter_chain.append(f"afade=t=out:st={fade_out_start:.2f}:d={fade_out:.2f}")
+        filter_parts.append(
+            f"[{input_index}:a]{','.join(filter_chain)}[{bed_label}]"
+        )
+        layer_mix_label = bed_label
+        if ducking:
+            filter_parts.append(
+                f"[{bed_label}][{dialogue_label}]sidechaincompress="
+                f"threshold={threshold}:ratio={ratio}:attack={attack}:release={release}:makeup={makeup}"
+                f"[{duck_label}]"
+            )
+            layer_mix_label = duck_label
+        filter_parts.append(
+            f"[{mix_label}][{layer_mix_label}]amix=inputs=2:duration=longest:dropout_transition=0[{next_mix_label}]"
+        )
+        mix_label = next_mix_label
+    return f"[{mix_label}]"
+
+
+def _resolve_ambient_layer(raw_layer, *, default_volume: float, default_ducking: bool,
+                           default_threshold: float, default_ratio: float,
+                           default_attack: float, default_release: float,
+                           default_makeup: float, default_name: str) -> dict | None:
+    if raw_layer is None:
+        return None
+    if isinstance(raw_layer, str):
+        payload = {"url": raw_layer}
+    elif isinstance(raw_layer, dict):
+        payload = raw_layer
+    else:
+        payload = raw_layer.model_dump()
+
+    url = _coerce_public_storage_url(
+        payload.get("url")
+        or payload.get("src")
+        or payload.get("ambient_music_url")
+        or payload.get("music_gcs_uri")
+        or payload.get("gcs_uri")
+        or payload.get("gcs_url")
+    )
+    if not url:
+        return None
+
+    def pick(key: str, fallback):
+        value = payload.get(key)
+        return fallback if value is None else value
+
+    return {
+        "name": str(payload.get("name") or default_name),
+        "url": url,
+        "volume": _coerce_float(pick("volume", default_volume), default_volume),
+        "ducking": _coerce_bool(pick("ducking", default_ducking), default_ducking),
+        "duck_threshold": _coerce_float(pick("duck_threshold", default_threshold), default_threshold),
+        "duck_ratio": _coerce_float(pick("duck_ratio", default_ratio), default_ratio),
+        "duck_attack": _coerce_float(pick("duck_attack", default_attack), default_attack),
+        "duck_release": _coerce_float(pick("duck_release", default_release), default_release),
+        "duck_makeup": _coerce_float(pick("duck_makeup", default_makeup), default_makeup),
+        "fade_in": _coerce_float(pick("fade_in", 2.0), 2.0),
+        "fade_out": _coerce_float(pick("fade_out", 3.0), 3.0),
+    }
+
+
+def _prepare_ambient_layers(job_dir: Path, body) -> list[dict]:
+    layers: list[dict] = []
+
+    primary_layer = _resolve_ambient_layer(
+        {
+            "name": "music",
+            "url": body.ambient_music_url,
+            "music_gcs_uri": body.music_gcs_uri,
+            "volume": body.ambient_volume,
+            "ducking": body.ambient_ducking,
+            "duck_threshold": body.ambient_duck_threshold,
+            "duck_ratio": body.ambient_duck_ratio,
+            "duck_attack": body.ambient_duck_attack,
+            "duck_release": body.ambient_duck_release,
+            "duck_makeup": body.ambient_duck_makeup,
+        },
+        default_volume=body.ambient_volume,
+        default_ducking=body.ambient_ducking,
+        default_threshold=body.ambient_duck_threshold,
+        default_ratio=body.ambient_duck_ratio,
+        default_attack=body.ambient_duck_attack,
+        default_release=body.ambient_duck_release,
+        default_makeup=body.ambient_duck_makeup,
+        default_name="music",
+    )
+    if primary_layer:
+        layers.append(primary_layer)
+
+    for idx, raw_layer in enumerate(body.ambient_fx_layers):
+        layer = _resolve_ambient_layer(
+            raw_layer,
+            default_volume=0.025,
+            default_ducking=False,
+            default_threshold=body.ambient_duck_threshold,
+            default_ratio=body.ambient_duck_ratio,
+            default_attack=body.ambient_duck_attack,
+            default_release=body.ambient_duck_release,
+            default_makeup=body.ambient_duck_makeup,
+            default_name=f"fx_{idx + 1}",
+        )
+        if layer:
+            layers.append(layer)
+
+    prepared_layers: list[dict] = []
+    for idx, layer in enumerate(layers):
+        ext = Path(layer["url"].split("?", 1)[0]).suffix or ".mp3"
+        slug = re.sub(r"[^a-z0-9_-]+", "_", str(layer["name"]).lower()).strip("_") or f"ambient_{idx + 1}"
+        path = job_dir / f"ambient_{idx + 1:02d}_{slug}{ext}"
+        if not _download_file(layer["url"], path):
+            logger.warning("ambient layer download failed name=%s url=%s", layer["name"], layer["url"])
+            continue
+        if not path.exists() or path.stat().st_size == 0:
+            logger.warning("ambient layer empty name=%s url=%s", layer["name"], layer["url"])
+            continue
+        prepared_layers.append({
+            **layer,
+            "path": path,
+        })
+    return prepared_layers
+
+
 def _srt_force_style(style: str = "bottom") -> str:
     """Return an ASS/SRT force_style string for the subtitles FFmpeg filter."""
     base = (
@@ -933,20 +1167,64 @@ async def render_dynamic(
 # No API costs, no polling, 15-30s render on Hetzner vs 60-120s Shotstack wait
 # ──────────────────────────────────────────────────────────────────────────────
 
+class PodcastTurn(BaseModel):
+    turn_index: int = Field(0, description="0-based order in the conversation")
+    speaker_id: str = Field("SPEAKER_1", description="Speaker id for this turn")
+    url: str = Field("", description="Public URL for the rendered turn audio")
+    text: str = Field("", description="Turn text, used only for logging/debug")
+    voice_energy: str = Field("anchor", description="Energy label from the voice writer")
+    estimated_duration: float = Field(0.0, description="n8n-side duration estimate in seconds")
+    gap_after: float = Field(0.06, description="Pause after this turn in seconds")
+    sequence_scope: str = Field("full", description="full | short")
+
+
+class AmbientFxLayer(BaseModel):
+    name: str = Field("", description="Optional label for logs/debugging")
+    url: str = Field("", description="Public URL for this ambient layer")
+    src: str = Field("", description="Alternate public URL field")
+    ambient_music_url: str = Field("", description="Alternate ambient URL field")
+    music_gcs_uri: str = Field("", description="Alternate gs:// field")
+    gcs_uri: str = Field("", description="Alternate gs:// field")
+    gcs_url: str = Field("", description="Alternate public URL field")
+    volume: float | None = Field(None, description="Layer volume 0.0-1.0")
+    ducking: bool | None = Field(None, description="Whether to duck this layer under dialogue")
+    duck_threshold: float | None = Field(None, description="Optional per-layer duck threshold")
+    duck_ratio: float | None = Field(None, description="Optional per-layer duck ratio")
+    duck_attack: float | None = Field(None, description="Optional per-layer duck attack")
+    duck_release: float | None = Field(None, description="Optional per-layer duck release")
+    duck_makeup: float | None = Field(None, description="Optional per-layer duck makeup gain")
+    fade_in: float | None = Field(None, description="Fade-in duration in seconds")
+    fade_out: float | None = Field(None, description="Fade-out duration in seconds")
+
+
 class PodcastRenderRequest(BaseModel):
     bg_loop_url:        str   = Field(...,  description="GCS URL of background loop video")
     host_audio_url:     str   = Field("",   description="GCS URL of host MP3 (empty when speaker_audio used)")
     reflection_audio_url: str = Field("",   description="GCS URL of reflection MP3 (optional)")
     # Multi-speaker fields sent by n8n Cast TTS node
     speaker_audio:      dict  = Field(default_factory=dict, description="SPEAKER_1..N dict from Cast TTS")
+    full_turns:         list[PodcastTurn] = Field(default_factory=list, description="Full episode turn clips in playback order")
+    short_turns:        list[PodcastTurn] = Field(default_factory=list, description="Short-cut turn clips in playback order")
+    full_sequence:      list[dict] = Field(default_factory=list, description="Raw full combined_sequence from the writer")
+    short_sequence:     list[dict] = Field(default_factory=list, description="Raw short combined_sequence from the writer")
+    render_style:       str   = Field("speaker_fallback", description="interleaved_dialogue | speaker_fallback")
+    turn_scope:         str   = Field("full", description="Prefer full or short turns when both are present")
     cast_size:          int   = Field(0,    description="Number of speakers (0 = derive from speaker_audio)")
     run_id:             str   = Field("",   description="Episode run_id from n8n")
     episode_title:      str   = Field("",   description="Alias for title (n8n sends episode_title)")
     ambient_music_url:  str   = Field("",  description="GCS URL or Pixabay URL of ambient music bed")
+    music_gcs_uri:      str   = Field("",  description="Legacy gs:// music URI fallback")
+    ambient_fx_layers:  list[AmbientFxLayer | str] = Field(default_factory=list, description="Optional extra ambient FX layers such as birds or water")
     host_duration:      float = Field(0,   description="Host audio duration in seconds (0 = auto-detect)")
     reflection_duration: float = Field(0,  description="Reflection audio duration in seconds (0 = auto-detect)")
     gap_seconds:        float = Field(0.5, description="Silence gap between host and reflection")
     ambient_volume:     float = Field(0.08,description="Ambient music volume 0.0–1.0")
+    ambient_ducking:    bool  = Field(True, description="Lower ambient music automatically while dialogue is active")
+    ambient_duck_threshold: float = Field(0.035, description="Sidechain threshold for ducking")
+    ambient_duck_ratio: float = Field(8.0, description="Compression ratio used for ducking")
+    ambient_duck_attack: float = Field(20.0, description="Attack time in ms for ducking")
+    ambient_duck_release: float = Field(280.0, description="Release time in ms for ducking")
+    ambient_duck_makeup: float = Field(1.0, description="Makeup gain after ducking compression")
     aspect_ratio:       str   = Field("9:16", description="'9:16' (Reels/Shorts) or '16:9' (YouTube)")
     title:              str   = Field("",  description="Episode title for drawtext overlay")
     scripture:          str   = Field("",  description="Scripture reference for drawtext overlay")
@@ -984,7 +1262,6 @@ async def render_podcast(body: PodcastRenderRequest):
         bg_path   = job_dir / "bg_loop.mp4"
         host_path = job_dir / "host.mp3"
         refl_path = job_dir / "reflection.mp3"
-        amb_path  = job_dir / "ambient.mp3"
         out_path  = job_dir / "podcast.mp4"
 
         # Resolve effective title — n8n sends episode_title, model field is title
@@ -994,9 +1271,106 @@ async def render_podcast(body: PodcastRenderRequest):
         if not _download_file(body.bg_loop_url, bg_path):
             raise HTTPException(400, "Could not download background loop video")
 
-        # ── Multi-speaker path: concat all speaker tracks into host.mp3 ──────
-        SPEAKER_ORDER = ["SPEAKER_1", "SPEAKER_2", "SPEAKER_3", "SPEAKER_4", "SPEAKER_GIRL"]
-        if body.speaker_audio:
+        def select_turns() -> list[PodcastTurn]:
+            preferred = str(body.turn_scope or "full").lower().strip()
+            if preferred == "short" and body.short_turns:
+                return sorted(body.short_turns, key=lambda turn: turn.turn_index)
+            if body.full_turns:
+                return sorted(body.full_turns, key=lambda turn: turn.turn_index)
+            if body.short_turns:
+                return sorted(body.short_turns, key=lambda turn: turn.turn_index)
+            return []
+
+        ambient_layers = _prepare_ambient_layers(job_dir, body)
+        has_ambient = bool(ambient_layers)
+
+        selected_turns = select_turns()
+
+        # ── Turn-based conversation path: preserve exact back-and-forth ─────
+        if selected_turns:
+            turn_inputs: list[str] = []
+            turn_filters: list[str] = []
+            mix_labels: list[str] = []
+            turn_cursor = 0.0
+            downloaded_turns = 0
+
+            for local_index, turn in enumerate(selected_turns):
+                if not turn.url.strip():
+                    continue
+                turn_path = job_dir / _safe_turn_filename(local_index, turn.speaker_id, turn.url)
+                if not _download_file(turn.url, turn_path):
+                    logger.warning("job=%s skipped turn %s (%s) download", job_id, turn.turn_index, turn.speaker_id)
+                    continue
+
+                duration = _measure_or_estimate_duration(turn_path, turn.estimated_duration)
+                if duration <= 0:
+                    logger.warning("job=%s skipped turn %s (%s) with unknown duration", job_id, turn.turn_index, turn.speaker_id)
+                    continue
+
+                delay_ms = max(int(round(turn_cursor * 1000)), 0)
+                input_index = downloaded_turns
+                label = f"turn{input_index}"
+                turn_inputs += ["-i", str(turn_path)]
+                turn_filters.append(
+                    f"[{input_index}:a]adelay={delay_ms}|{delay_ms},volume=1.0[{label}]"
+                )
+                mix_labels.append(f"[{label}]")
+                downloaded_turns += 1
+
+                gap_after = max(float(turn.gap_after or 0.0), 0.0) if local_index < len(selected_turns) - 1 else 0.0
+                turn_cursor += duration + gap_after
+
+            if not downloaded_turns:
+                raise HTTPException(502, "Turn audio was provided but none of the turn clips could be downloaded")
+
+            total = max(turn_cursor + 0.5, 0.5)
+            if len(mix_labels) > 1:
+                turn_filters.append(
+                    f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:duration=longest:dropout_transition=0[dialogue]"
+                )
+                dialogue_label = "dialogue"
+            else:
+                dialogue_label = mix_labels[0].strip("[]")
+
+            audio_map_label = f"[{dialogue_label}]"
+            if has_ambient:
+                for ambient_index, layer in enumerate(ambient_layers):
+                    layer["input_index"] = downloaded_turns + ambient_index
+                    turn_inputs += [
+                        "-stream_loop", "-1", "-t", f"{total:.2f}", "-i", str(layer["path"])
+                    ]
+                audio_map_label = _append_ambient_layers_mix(
+                    turn_filters,
+                    dialogue_label,
+                    dialogue_label,
+                    ambient_layers,
+                    total,
+                )
+
+            mixed_path = job_dir / "mixed.aac"
+            _run_ffmpeg(
+                turn_inputs + [
+                    "-filter_complex", ";".join(turn_filters),
+                    "-map", audio_map_label,
+                    "-c:a", "aac", "-b:a", "192k", "-vn",
+                    str(mixed_path),
+                ]
+            )
+
+            logger.info(
+                "job=%s interleaved dialogue: %d turns, total=%.1fs, style=%s ambient_layers=%d ducking=%s",
+                job_id,
+                downloaded_turns,
+                total,
+                body.render_style,
+                len(ambient_layers),
+                body.ambient_ducking,
+            )
+
+        # ── Speaker fallback: flatten one file per speaker in fixed order ────
+        # This keeps older workflows working, but it does not preserve turn order.
+        elif body.speaker_audio:
+            SPEAKER_ORDER = ["SPEAKER_1", "SPEAKER_2", "SPEAKER_3", "SPEAKER_4", "SPEAKER_GIRL"]
             spk_urls = [
                 body.speaker_audio[k]["full_url"]
                 for k in SPEAKER_ORDER
@@ -1036,74 +1410,71 @@ async def render_podcast(body: PodcastRenderRequest):
             if not _download_file(body.host_audio_url, host_path):
                 raise HTTPException(400, "Could not download host audio")
         else:
-            raise HTTPException(400, "Provide either speaker_audio or host_audio_url")
+            raise HTTPException(400, "Provide full_turns/short_turns, speaker_audio, or host_audio_url")
 
-        has_reflection = bool(body.reflection_audio_url.strip())
-        has_ambient    = bool(body.ambient_music_url.strip())
+        if not selected_turns:
+            has_reflection = bool(body.reflection_audio_url.strip())
 
-        if has_reflection:
-            _download_file(body.reflection_audio_url, refl_path)
-            has_reflection = refl_path.exists() and refl_path.stat().st_size > 0
+            if has_reflection:
+                _download_file(body.reflection_audio_url, refl_path)
+                has_reflection = refl_path.exists() and refl_path.stat().st_size > 0
 
-        if has_ambient:
-            _download_file(body.ambient_music_url, amb_path)
-            has_ambient = amb_path.exists() and amb_path.stat().st_size > 0
+            # ── Measure durations ─────────────────────────────────────────────
+            host_dur = body.host_duration or _get_audio_duration(host_path)
+            refl_dur = (body.reflection_duration or _get_audio_duration(refl_path)) if has_reflection else 0.0
+            total = host_dur + (refl_dur + body.gap_seconds if has_reflection else 0) + 0.5
 
-        # ── Measure durations ─────────────────────────────────────────────────
-        host_dur = body.host_duration or _get_audio_duration(host_path)
-        refl_dur = (body.reflection_duration or _get_audio_duration(refl_path)) if has_reflection else 0.0
-        total    = host_dur + (refl_dur + body.gap_seconds if has_reflection else 0) + 0.5
-        fade_out_start = max(0.0, total - 3.0)
+            logger.info("job=%s host=%.1fs refl=%.1fs total=%.1fs", job_id, host_dur, refl_dur, total)
 
-        logger.info("job=%s host=%.1fs refl=%.1fs total=%.1fs", job_id, host_dur, refl_dur, total)
+            # ── Pass 1: audio-only mix (re-indexed, no video, no loudnorm) ──
+            audio_mix_inputs = ["-i", str(host_path)]
+            audio_fc_parts = ["[0:a]volume=1.0[host]"]
+            mix_labels = ["[host]"]
+            mix_count = 1
+            audio_idx = 1
 
-        # ── Pass 1: audio-only mix (re-indexed, no video, no loudnorm) ──────────
-        # Build audio inputs with sequential indices (no bg video input here).
-        audio_mix_inputs = ["-i", str(host_path)]   # 0: host
-        audio_fc_parts   = ["[0:a]volume=1.0[host]"]
-        mix_labels       = ["[host]"]
-        mix_count        = 1
-        audio_idx        = 1   # next audio input index
+            if has_reflection:
+                delay_ms = int((host_dur + body.gap_seconds) * 1000)
+                audio_mix_inputs += ["-i", str(refl_path)]
+                audio_fc_parts.append(
+                    f"[{audio_idx}:a]adelay={delay_ms}|{delay_ms},volume=1.0[refl]"
+                )
+                mix_labels.append("[refl]")
+                mix_count += 1
+                audio_idx += 1
 
-        if has_reflection:
-            delay_ms = int((host_dur + body.gap_seconds) * 1000)
-            audio_mix_inputs += ["-i", str(refl_path)]   # audio_idx
-            audio_fc_parts.append(
-                f"[{audio_idx}:a]adelay={delay_ms}|{delay_ms},volume=1.0[refl]"
+            if mix_count > 1:
+                audio_fc_parts.append(
+                    f"{''.join(mix_labels)}amix=inputs={mix_count}:duration=longest:dropout_transition=2[dialogue]"
+                )
+                dialogue_label = "dialogue"
+            else:
+                dialogue_label = "host"
+
+            audio_map_label = f"[{dialogue_label}]"
+            if has_ambient:
+                for ambient_index, layer in enumerate(ambient_layers):
+                    layer["input_index"] = audio_idx + ambient_index
+                    audio_mix_inputs += [
+                        "-stream_loop", "-1", "-t", f"{total:.2f}", "-i", str(layer["path"])
+                    ]
+                audio_map_label = _append_ambient_layers_mix(
+                    audio_fc_parts,
+                    dialogue_label,
+                    dialogue_label,
+                    ambient_layers,
+                    total,
+                )
+
+            mixed_path = job_dir / "mixed.aac"
+            _run_ffmpeg(
+                audio_mix_inputs + [
+                    "-filter_complex", ";".join(audio_fc_parts),
+                    "-map", audio_map_label,
+                    "-c:a", "aac", "-b:a", "192k", "-vn",
+                    str(mixed_path),
+                ]
             )
-            mix_labels.append("[refl]")
-            mix_count += 1
-            audio_idx += 1
-
-        if has_ambient:
-            audio_mix_inputs += [
-                "-stream_loop", "-1", "-t", f"{total:.2f}", "-i", str(amb_path)
-            ]
-            audio_fc_parts.append(
-                f"[{audio_idx}:a]volume={body.ambient_volume},"
-                f"afade=t=in:st=0:d=2,"
-                f"afade=t=out:st={fade_out_start:.2f}:d=3[amb]"
-            )
-            mix_labels.append("[amb]")
-            mix_count += 1
-
-        if mix_count > 1:
-            audio_fc_parts.append(
-                f"{''.join(mix_labels)}amix=inputs={mix_count}:duration=longest:dropout_transition=2[amix]"
-            )
-            audio_map_label = "[amix]"
-        else:
-            audio_map_label = "[host]"
-
-        mixed_path = job_dir / "mixed.aac"
-        _run_ffmpeg(
-            audio_mix_inputs + [
-                "-filter_complex", ";".join(audio_fc_parts),
-                "-map", audio_map_label,
-                "-c:a", "aac", "-b:a", "192k", "-vn",
-                str(mixed_path),
-            ]
-        )
 
         # ── Pass 2: normalize the mixed audio ────────────────────────────────
         normed_path = _prenorm_audio(mixed_path, job_dir / "normed.aac")
