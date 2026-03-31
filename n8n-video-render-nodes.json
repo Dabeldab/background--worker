@@ -1,0 +1,183 @@
+{
+  "_readme": "Add these 4 nodes to DV001 after your ElevenLabs audio node. Wire: ElevenLabs → 🎨 Video Format Agent → (parallel) 🖼️ Pixabay Images + 🎵 Pixabay Music → 🔀 Merge: Video Assets → 🎬 Render Dynamic Video",
+
+  "nodes": [
+
+    {
+      "name": "🎨 Video Format Agent",
+      "type": "n8n-nodes-base.lmChatOpenAi",
+      "typeVersion": 1,
+      "notes": "LLM decides which video format best fits the episode vibe and script. Uses gpt-4.1-mini for speed.",
+      "parameters": {
+        "model": "gpt-4.1-mini",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are the Walk With Me video format director. Your job is to choose the best short-form video format for a devotional episode so it gets maximum watch time on Instagram Reels, TikTok, and YouTube Shorts.\n\nVIDEO FORMAT OPTIONS:\n- audiogram: waveform animation on branded background. Best for: raw_confession, late_night_thoughts, quietly_heavy, solo cast, introspective vibes.\n- captioned: waveform + auto-captions burned in. Best for: podcast_dialogue, teaching_moment, group_conversation, any dialogue-heavy script.\n- slideshow: Ken Burns photo slideshow, no captions. Best for: vignette_scene, vacation_surprise, wonder_awe vibe, scenic or atmospheric settings.\n- captioned_slideshow: slideshow + burned captions. Best for: narrative stories, stranger_encounter, family_tension — visual + words together.\n- scripture_cards: animated title and scripture text over waveform. Best for: devotional tone, tender_vulnerable, short meditative scripts, scripture-heavy content.\n- full: branded intro card + slideshow + captions. Best for: the strongest episodes of the week, funny_real or unexpectedly_joyful vibes, high-energy casts.\n\nRETURN ONLY valid JSON. No explanation outside the JSON object."
+            },
+            {
+              "role": "user",
+              "content": "=Episode details:\n- Title: {{ $('📝 Voice Writer').item.json.episode_title || 'Daily Devotional' }}\n- Vibe: {{ $('🌐 Merge Signal Source').item.json.world_pulse?.creative_rotation?.episode_format?.vibe || 'warm' }}\n- Format type: {{ $('🌐 Merge Signal Source').item.json.world_pulse?.creative_rotation?.episode_format?.format_type || 'vignette_scene' }}\n- Setting: {{ $('🌐 Merge Signal Source').item.json.world_pulse?.creative_rotation?.episode_format?.setting || '' }}\n- Cast: {{ $('🌐 Merge Signal Source').item.json.world_pulse?.creative_rotation?.episode_format?.cast || 'solo' }}\n- Scripture: {{ $('🌐 Merge Signal Source').item.json.world_pulse?.calendar?.primary_verse || '' }}\n- Script excerpt (first 400 chars): {{ ($('📝 Voice Writer').item.json.script || '').substring(0, 400) }}\n\nReturn JSON with exactly these fields:\n{\n  \"video_format\": \"<one of the 6 options>\",\n  \"pixabay_image_query\": \"<2-4 word search for royalty-free background images>\",\n  \"pixabay_music_query\": \"<2-4 word search for background ambient music>\",\n  \"music_volume\": <number between 0.05 and 0.12>,\n  \"caption_style\": \"<bottom|center|top>\",\n  \"viz_style\": \"<waveform|spectrum>\",\n  \"rationale\": \"<one sentence>\"\n}"
+            }
+          ]
+        },
+        "jsonOutput": true
+      },
+      "credentials": {
+        "openAiApi": { "id": "YpQmaMDXngShD30G", "name": "OpenAi account" }
+      }
+    },
+
+    {
+      "name": "🖼️ Pixabay: Fetch Images",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notes": "Fetches up to 5 royalty-free photos from Pixabay matching the agent's image query. Only runs for slideshow formats.",
+      "parameters": {
+        "method": "GET",
+        "url": "https://pixabay.com/api/",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "key",         "value": "={{ $env.PIXABAY_API_KEY }}" },
+            { "name": "q",           "value": "={{ $('🎨 Video Format Agent').item.json.pixabay_image_query }}" },
+            { "name": "image_type",  "value": "photo" },
+            { "name": "orientation", "value": "vertical" },
+            { "name": "per_page",    "value": "5" },
+            { "name": "safesearch",  "value": "true" },
+            { "name": "min_width",   "value": "1080" }
+          ]
+        },
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+
+    {
+      "name": "🎵 Pixabay: Fetch Music",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notes": "Fetches ambient background music from Pixabay. Check https://pixabay.com/api/docs/ for the exact music endpoint — it may be /api/music/ or require a media_type param.",
+      "parameters": {
+        "method": "GET",
+        "url": "https://pixabay.com/api/",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "key",        "value": "={{ $env.PIXABAY_API_KEY }}" },
+            { "name": "q",          "value": "={{ $('🎨 Video Format Agent').item.json.pixabay_music_query }}" },
+            { "name": "media_type", "value": "music" },
+            { "name": "per_page",   "value": "5" }
+          ]
+        },
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+
+    {
+      "name": "🔀 Merge: Video Assets",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "notes": "Waits for both Pixabay calls to finish before sending to renderer.",
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition",
+        "numberInputs": 2
+      }
+    },
+
+    {
+      "name": "🎬 Render Dynamic Video",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notes": "Sends audio + all metadata to /render-dynamic. Returns MP4 binary.",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.BACKGROUND_WORKER_URL }}/render-dynamic",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "audio",
+              "inputDataFieldName": "data"
+            },
+            {
+              "name": "video_format",
+              "value": "={{ $('🎨 Video Format Agent').item.json.video_format || 'captioned' }}"
+            },
+            {
+              "name": "title",
+              "value": "={{ $('📝 Voice Writer').item.json.episode_title || 'Daily Devotional' }}"
+            },
+            {
+              "name": "scripture",
+              "value": "={{ $('🌐 Merge Signal Source').item.json.world_pulse?.calendar?.primary_verse || '' }}"
+            },
+            {
+              "name": "day_label",
+              "value": "={{ 'Day ' + $('📅 Build Daily Context').item.json.day_of_year + ' · ' + $('📅 Build Daily Context').item.json.day_name }}"
+            },
+            {
+              "name": "image_urls",
+              "value": "={{ JSON.stringify(($('🖼️ Pixabay: Fetch Images').item.json.hits || []).map(h => h.largeImageURL || h.webformatURL).filter(Boolean)) }}"
+            },
+            {
+              "name": "pixabay_music_url",
+              "value": "={{ ($('🎵 Pixabay: Fetch Music').item.json.hits || [])[0]?.audio || ($('🎵 Pixabay: Fetch Music').item.json.hits || [])[0]?.audioUrl || '' }}"
+            },
+            {
+              "name": "music_volume",
+              "value": "={{ $('🎨 Video Format Agent').item.json.music_volume || 0.08 }}"
+            },
+            {
+              "name": "caption_style",
+              "value": "={{ $('🎨 Video Format Agent').item.json.caption_style || 'bottom' }}"
+            },
+            {
+              "name": "viz_style",
+              "value": "={{ $('🎨 Video Format Agent').item.json.viz_style || 'waveform' }}"
+            },
+            {
+              "name": "quality",
+              "value": "medium"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "video"
+            }
+          },
+          "timeout": 480000
+        }
+      },
+      "continueOnFail": true
+    }
+
+  ],
+
+  "wiring": [
+    "ElevenLabs audio node → 🎨 Video Format Agent",
+    "🎨 Video Format Agent → 🖼️ Pixabay: Fetch Images",
+    "🎨 Video Format Agent → 🎵 Pixabay: Fetch Music",
+    "🖼️ Pixabay: Fetch Images → 🔀 Merge: Video Assets (input 1)",
+    "🎵 Pixabay: Fetch Music  → 🔀 Merge: Video Assets (input 2)",
+    "🔀 Merge: Video Assets → 🎬 Render Dynamic Video",
+    "NOTE: The ElevenLabs audio binary must also reach 🎬 Render Dynamic Video.",
+    "Best approach: wire ElevenLabs → 🎬 Render Dynamic Video as a second input,",
+    "then use $('ElevenLabs Node').item.binary.data in the audio field instead of $input."
+  ],
+
+  "env_vars_needed": [
+    "PIXABAY_API_KEY  — free at https://pixabay.com/api/docs/ (register → get key)",
+    "BACKGROUND_WORKER_URL — e.g. https://your-worker.hetzner.com"
+  ],
+
+  "pixabay_music_note": "The Pixabay music API endpoint may differ from the image API. Check https://pixabay.com/api/docs/ and look for the 'Audio' or 'Music' section. The audio file URL field in the response may be called 'audio', 'audioUrl', or 'previewUrl' — update the pixabay_music_url expression in 🎬 Render Dynamic Video accordingly once you confirm the response shape."
+}
