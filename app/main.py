@@ -17,10 +17,11 @@ import time
 import uuid
 from contextvars import ContextVar
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1461,6 +1462,22 @@ class AmbientFxLayer(BaseModel):
 
 
 class PodcastRenderRequest(BaseModel):
+    """POST /render-podcast JSON body.
+
+    **media_sequence** — When non-empty after staging, overrides rotating
+    ``background_local_paths`` for the video background layer (see field help).
+
+    **Outro** — Optional still image → silent clip, then dissolve (video) and
+    acrossfade (audio) from the end of the main program into that clip.
+
+    **Sequence metadata** — ``full_sequence`` / ``short_sequence`` and the
+    workflow-only fields at the bottom of this model are accepted for n8n parity;
+    FFmpeg uses ``full_turns`` / ``short_turns`` and ``speaker_audio``, not the raw
+    writer sequences or pulse/cast metadata.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
     bg_loop_url:        str   = Field("",  description="Public URL of background loop video")
     bg_loop_gcs_uri:    str   = Field("",  description="Optional gs:// background loop fallback")
     bg_object_path:     str   = Field("",  description="Optional bucket object path for the background loop")
@@ -1469,13 +1486,35 @@ class PodcastRenderRequest(BaseModel):
         default_factory=list,
         description="Optional list of local background videos to rotate through during the episode",
     )
-    media_sequence: list[dict] = Field(
+    media_sequence: list[dict[str, Any] | str] = Field(
         default_factory=list,
-        description="Optional ordered media sequence for local-first backgrounds",
+        description=(
+            "Ordered background clips from the workflow. Each item: a string (path or URL) or a dict with "
+            "local_path/path/file and/or url/src/bg_loop_url and/or gcs_uri/object_path. "
+            "Items are staged to the job dir in order. If 2+ succeed: concatenated with equal segment length "
+            "(max(total/n, 3s)) into one background. If exactly 1 succeeds: that file is the full background. "
+            "If none succeed: falls back to background_local_paths (multi) then bg_loop_url/background_local_path."
+        ),
     )
-    outro_image_local_path: str = Field("", description="Optional local filesystem path to the branded outro image")
-    outro_duration: float = Field(4.0, description="How long the outro card should hold, in seconds")
-    outro_fade_duration: float = Field(1.2, description="Crossfade duration into the outro card, in seconds")
+    outro_image_local_path: str = Field(
+        "",
+        description="Local path to outro still (n8n often maps global outro_image_path here).",
+    )
+    outro_image_url: str = Field(
+        "",
+        description="If no usable local outro file, download this URL and treat as outro still.",
+    )
+    outro_duration: float = Field(
+        4.0,
+        description="Length of the outro video segment after the main program (seconds).",
+    )
+    outro_fade_duration: float = Field(
+        1.2,
+        description=(
+            "Overlap between main and outro: video dissolve + audio acrossfade starting at (main_duration - fade). "
+            "Clamped to ≤ main length and ≤ outro_duration."
+        ),
+    )
     host_audio_url:     str   = Field("",   description="GCS URL of host MP3 (empty when speaker_audio used)")
     host_audio_gcs_uri: str   = Field("",   description="Optional gs:// host audio fallback")
     host_audio_local_path: str = Field("", description="Optional local filesystem path for host audio")
@@ -1486,16 +1525,22 @@ class PodcastRenderRequest(BaseModel):
     speaker_audio:      dict  = Field(default_factory=dict, description="SPEAKER_1..N dict from Cast TTS")
     full_turns:         list[PodcastTurn] = Field(default_factory=list, description="Full episode turn clips in playback order")
     short_turns:        list[PodcastTurn] = Field(default_factory=list, description="Short-cut turn clips in playback order")
-    full_sequence:      list[dict] = Field(default_factory=list, description="Raw full combined_sequence from the writer")
-    short_sequence:     list[dict] = Field(default_factory=list, description="Raw short combined_sequence from the writer")
+    full_sequence: list[Any] = Field(
+        default_factory=list,
+        description="Writer combined_sequence (full); accepted for parity — render uses full_turns/speaker_audio, not this.",
+    )
+    short_sequence: list[Any] = Field(
+        default_factory=list,
+        description="Writer combined_sequence (short); accepted for parity — render uses short_turns/speaker_audio, not this.",
+    )
     render_style:       str   = Field("speaker_fallback", description="interleaved_dialogue | speaker_fallback")
     turn_scope:         str   = Field("full", description="Prefer full or short turns when both are present")
     cast_size:          int   = Field(0,    description="Number of speakers (0 = derive from speaker_audio)")
     local_asset_preferred: bool = Field(False, description="Prefer local filesystem assets when available")
     run_id:             str   = Field("",   description="Episode run_id from n8n")
     media_temp_root:    str   = Field(
-        "/mnt/HC_Volume_105210642/temp_runs",
-        description="Root temp directory for run-scoped staging (paths derived for n8n)",
+        "/mnt/HC_Volume_105210642/runs",
+        description="Root temp directory for run-scoped staging (must match workflow MEDIA_TEMP_ROOT / Build Podcast Render Paths)",
     )
     run_root:           str   = Field("",   description="Derived run root directory")
     audio_root:         str   = Field("",   description="Derived audio root directory")
@@ -1545,6 +1590,31 @@ class PodcastRenderRequest(BaseModel):
     dynamic_word_emphasis: bool = Field(True, description="Prefer denser, punchier word timing when available")
     caption_animation_level: str = Field("medium", description="low | medium | high")
     caption_density_hint: str = Field("balanced", description="slower | balanced | faster")
+
+    # ── Workflow-only / future use: stored on the model, not read by render FFmpeg logic ──
+    mode: str = Field("", description="e.g. dialogue_video from n8n; ignored by render.")
+    visual_mode: str = Field("", description="From Select Background Loop; ignored by render.")
+    tone_lean: str = Field("", description="World pulse; ignored by render.")
+    vibe_texture: str = Field("", description="World pulse; ignored by render.")
+    scene_seeds: list[Any] = Field(default_factory=list, description="World pulse; ignored by render.")
+    ordinary_details: list[Any] = Field(default_factory=list, description="World pulse; ignored by render.")
+    spoken_language_fragments: list[Any] = Field(
+        default_factory=list, description="World pulse; ignored by render."
+    )
+    cast: list[Any] = Field(
+        default_factory=list,
+        description="Voice writer cast list; ignored by render (turns carry speaker ids).",
+    )
+    speaker_pool: dict[str, Any] = Field(default_factory=dict, description="TTS ids; ignored by render.")
+    voice_roster: dict[str, Any] = Field(default_factory=dict, description="Roster hints; ignored by render.")
+    host_short_local_path: str = Field(
+        "",
+        description="Short-cut host audio local path; not wired — use turn_scope/short_turns with local URLs/paths.",
+    )
+    reflection_short_local_path: str = Field(
+        "",
+        description="Short-cut reflection local path; not wired — use short_turns/speaker_audio.",
+    )
 
 
 def _stage_local_or_remote_asset(source_url: str, dest_path: Path, *, local_path: str = "") -> bool:
@@ -1612,19 +1682,28 @@ def _has_speaker_scope_source(entry: dict, scope: str = "full") -> bool:
 
 
 def _build_background_sequence(
-    local_paths: list[str], total: float, job_dir: Path, W: int, H: int, preset: str
+    paths_in: list[str | Path],
+    total: float,
+    job_dir: Path,
+    W: int,
+    H: int,
+    preset: str,
 ) -> Path | None:
-    """Concatenate multiple local background clips into one loopable segment for the episode."""
+    """Concatenate multiple background clips (video or still) into one segment for the episode."""
     unique_paths: list[Path] = []
     seen: set[str] = set()
-    for raw in local_paths or []:
-        p = str(raw or "").strip()
-        if not p or p in seen:
+    for raw in paths_in or []:
+        path = Path(raw) if not isinstance(raw, Path) else raw
+        if not path.is_file():
             continue
-        path = Path(p)
-        if path.exists() and path.is_file():
-            unique_paths.append(path)
-            seen.add(p)
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        if key in seen:
+            continue
+        unique_paths.append(path)
+        seen.add(key)
     if len(unique_paths) <= 1:
         return None
 
@@ -1673,6 +1752,172 @@ def _build_background_sequence(
     return out_path if out_path.exists() and out_path.stat().st_size > 0 else None
 
 
+def _normalize_media_sequence_entry(entry) -> dict:
+    if entry is None:
+        return {}
+    if isinstance(entry, dict):
+        return entry
+    if isinstance(entry, str):
+        s = entry.strip()
+        return {"path": s} if s else {}
+    md = getattr(entry, "model_dump", None)
+    if callable(md):
+        return md()
+    return {}
+
+
+def _stage_podcast_media_sequence(media_sequence: list, job_dir: Path) -> list[Path]:
+    """Download/copy each media_sequence item into job_dir; return existing files in order.
+
+    Per-item resolution: local_path → path → file; else url → src → bg_loop_url;
+    else gcs_uri / object_path (via HTTPS). Failed items are skipped with a warning.
+    """
+    out: list[Path] = []
+    for i, raw in enumerate(media_sequence or []):
+        payload = _normalize_media_sequence_entry(raw)
+        local = str(
+            payload.get("local_path")
+            or payload.get("path")
+            or payload.get("file")
+            or ""
+        ).strip()
+        url = str(
+            payload.get("url")
+            or payload.get("src")
+            or payload.get("bg_loop_url")
+            or ""
+        ).strip()
+        gcs = str(
+            payload.get("gcs_uri") or payload.get("bg_loop_gcs_uri") or ""
+        ).strip()
+        obj = str(
+            payload.get("object_path") or payload.get("bg_object_path") or ""
+        ).strip()
+        hint = local or url or gcs or obj or ""
+        stem = Path(hint.split("?", 1)[0])
+        suf = stem.suffix.lower()
+        if suf not in {
+            ".mp4", ".mov", ".webm", ".mkv", ".m4v",
+            ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif",
+        }:
+            suf = ".mp4"
+        dest = job_dir / f"media_seq_{i:03d}{suf}"
+        remote_url = url or _coerce_public_storage_url(gcs or obj)
+        ok = _stage_any_asset(
+            dest_path=dest,
+            local_path=local,
+            gcs_uri=gcs,
+            object_path=obj,
+            url=remote_url,
+        )
+        if ok and dest.exists() and dest.stat().st_size > 0:
+            out.append(dest)
+        else:
+            logger.warning(
+                "media_sequence item %d stage failed hint=%s",
+                i,
+                (hint[:120] + "…") if len(hint) > 120 else hint or "(empty)",
+            )
+    return out
+
+
+def _build_outro_from_image(
+    image_path: Path,
+    outro_duration: float,
+    W: int,
+    H: int,
+    job_dir: Path,
+    preset: str,
+) -> Path:
+    """Ken-burns style still → H.264 + silent stereo AAC (same WxH as episode)."""
+    out_path = job_dir / "outro_segment.mp4"
+    outro_duration = max(0.5, float(outro_duration or 0.0))
+    zoom_frames = max(int(outro_duration * 30), 30)
+    vf = (
+        f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+        f"crop={W}:{H},{_WWM_VIDEO_SHARPEN},"
+        f"zoompan=z='min(zoom+0.0002,1.04)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        f":d={zoom_frames}:s={W}x{H}:fps=30"
+    )
+    _run_ffmpeg(
+        [
+            "-loop",
+            "1",
+            "-t",
+            f"{outro_duration:.3f}",
+            "-i",
+            str(image_path),
+            "-f",
+            "lavfi",
+            "-t",
+            f"{outro_duration:.3f}",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            "22",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-pix_fmt",
+            "yuv420p",
+            str(out_path),
+        ]
+    )
+    return out_path
+
+
+def _xfade_main_with_outro(
+    main_mp4: Path,
+    outro_mp4: Path,
+    main_duration: float,
+    fade_duration: float,
+    out_final: Path,
+    preset: str,
+) -> None:
+    """Join main + outro: xfade starts at main_duration−fade; program audio fades into outro audio (silent)."""
+    main_duration = float(main_duration or 0.0)
+    fade_duration = max(0.05, float(fade_duration or 0.0))
+    fade_duration = min(fade_duration, max(main_duration * 0.99, 0.05))
+    offset = max(0.0, main_duration - fade_duration)
+    _run_ffmpeg(
+        [
+            "-i",
+            str(main_mp4),
+            "-i",
+            str(outro_mp4),
+            "-filter_complex",
+            (
+                f"[0:v][1:v]xfade=transition=dissolve:duration={fade_duration:.3f}:offset={offset:.3f}[v];"
+                f"[0:a][1:a]acrossfade=duration={fade_duration:.3f}[a]"
+            ),
+            "-map",
+            "[v]",
+            "-map",
+            "[a]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            "22",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-pix_fmt",
+            "yuv420p",
+            str(out_final),
+        ]
+    )
+
+
 @app.post("/render-podcast")
 async def render_podcast(body: PodcastRenderRequest):
     """
@@ -1680,12 +1925,25 @@ async def render_podcast(body: PodcastRenderRequest):
     Downloads bg loop video + audio tracks from GCS/URL, assembles with FFmpeg,
     returns MP4 binary.
 
+    Background priority when building the video layer:
+      1. media_sequence — ordered list of dicts (local_path/path and/or url/gcs_uri)
+         or strings (path or URL); 2+ clips are concatenated like background_local_paths.
+      2. background_local_paths — multiple local files → concat.
+      3. bg_loop_url / background_local_path — single staged bg_loop.
+
+    Outro: optional outro_image_local_path or outro_image_url → silent outro MP4, then
+    dissolve + acrossfade from main tail into outro (outro_fade_duration, outro_duration).
+    Captions are timed to the main program only (no burn-in on the outro card).
+
+    Metadata: full_sequence, short_sequence, tone_lean, cast, speaker_pool, etc. are
+    accepted on the JSON body for orchestrator parity; they do not change filters.
+
     Shotstack equivalent:
       timeline.tracks[0] = background loop video (zoomInSlow effect)
       timeline.tracks[1] = host audio + reflection audio
       timeline.soundtrack = ambient music bed at low volume with fade in/out
     """
-    media_temp_root = body.media_temp_root or "/mnt/HC_Volume_105210642/temp_runs"
+    media_temp_root = body.media_temp_root or "/mnt/HC_Volume_105210642/runs"
     run_id = (body.run_id or "").strip() or uuid.uuid4().hex[:12]
     run_root = body.run_root or os.path.join(media_temp_root, run_id)
     audio_root = body.audio_root or os.path.join(run_root, "audio")
@@ -2034,11 +2292,42 @@ async def render_podcast(body: PodcastRenderRequest):
                 logger.warning("job=%s subtitle generation failed: %s", job_id, e)
                 srt_path = None
 
-        # ── Rotating backgrounds: use synthesized sequence when multiple locals exist ─
-        bg_sequence_path = _build_background_sequence(
-            body.background_local_paths, total, job_dir, W, H, preset
-        )
-        effective_bg_path = bg_sequence_path or bg_path
+        # ── Background: media_sequence (workflow) overrides background_local_paths ─
+        staged_media = _stage_podcast_media_sequence(body.media_sequence, job_dir)
+        bg_sequence_path: Path | None = None
+        if len(staged_media) >= 2:
+            logger.info(
+                "job=%s background from media_sequence (%d clips)",
+                job_id,
+                len(staged_media),
+            )
+            bg_sequence_path = _build_background_sequence(
+                staged_media, total, job_dir, W, H, preset
+            )
+            effective_bg_path = bg_sequence_path or bg_path
+        elif len(staged_media) == 1:
+            logger.info("job=%s background from media_sequence (single clip)", job_id)
+            effective_bg_path = staged_media[0]
+        else:
+            bg_sequence_path = _build_background_sequence(
+                body.background_local_paths, total, job_dir, W, H, preset
+            )
+            effective_bg_path = bg_sequence_path or bg_path
+
+        outro_local = str(body.outro_image_local_path or "").strip()
+        outro_url = str(body.outro_image_url or "").strip()
+        outro_resolved: Path | None = None
+        if outro_local:
+            lp = Path(outro_local)
+            if lp.is_file():
+                outro_resolved = lp
+        if outro_resolved is None and outro_url:
+            outro_dl = job_dir / "outro_download.png"
+            if _download_file(outro_url, outro_dl, timeout=60) and outro_dl.stat().st_size > 0:
+                outro_resolved = outro_dl
+        has_outro = outro_resolved is not None
+        body_mp4 = job_dir / "podcast_body.mp4"
+        encode_target = body_mp4 if has_outro else out_path
 
         # ── Pass 3: video render with pre-normed audio (waveform + captions) ─
         inputs = [
@@ -2157,16 +2446,51 @@ async def render_podcast(body: PodcastRenderRequest):
                 "-c:a", "aac", "-b:a", "192k",
                 "-pix_fmt", "yuv420p",
                 "-t", f"{total:.2f}",
-                str(out_path),
+                str(encode_target),
             ]
         )
+
+        export_duration = float(total)
+        if has_outro:
+            try:
+                outro_dur = max(0.5, float(body.outro_duration or 0.0))
+                fade_d = float(body.outro_fade_duration or 0.0)
+                fade_d = max(0.05, min(fade_d, total * 0.95, outro_dur))
+                assert outro_resolved is not None
+                outro_clip = _build_outro_from_image(
+                    outro_resolved,
+                    outro_dur,
+                    W,
+                    H,
+                    job_dir,
+                    preset,
+                )
+                _xfade_main_with_outro(
+                    body_mp4,
+                    outro_clip,
+                    total,
+                    fade_d,
+                    out_path,
+                    preset,
+                )
+                export_duration = float(total) + outro_dur - fade_d
+                logger.info(
+                    "job=%s outro appended fade=%.2fs outro_dur=%.2fs export=%.1fs",
+                    job_id,
+                    fade_d,
+                    outro_dur,
+                    export_duration,
+                )
+            except Exception as e:
+                logger.warning("job=%s outro failed, using body only: %s", job_id, e)
+                shutil.move(str(body_mp4), str(out_path))
 
         logger.info("job=%s podcast render complete size=%d", job_id, out_path.stat().st_size)
         render_ok = True
         return FileResponse(
             str(out_path), media_type="video/mp4",
             filename=f"wwm_podcast_{job_id}.mp4",
-            headers={"X-Job-Id": job_id, "X-Duration": f"{total:.1f}"},
+            headers={"X-Job-Id": job_id, "X-Duration": f"{export_duration:.1f}"},
         )
 
     except HTTPException as e:
