@@ -12,7 +12,10 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import threading
+import time
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -30,24 +33,27 @@ WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
 SUB_LANGS = os.environ.get("YTDLP_SUB_LANGS", "en.*,en-US.*")
 
 _whisper_model = None
+_whisper_lock = threading.Lock()
 
 
 def get_whisper():
     global _whisper_model
     if _whisper_model is None:
-        from faster_whisper import WhisperModel
+        with _whisper_lock:
+            if _whisper_model is None:
+                from faster_whisper import WhisperModel
 
-        logger.info(
-            "Loading Whisper model=%s device=%s compute=%s",
-            WHISPER_MODEL,
-            WHISPER_DEVICE,
-            WHISPER_COMPUTE,
-        )
-        _whisper_model = WhisperModel(
-            WHISPER_MODEL,
-            device=WHISPER_DEVICE,
-            compute_type=WHISPER_COMPUTE,
-        )
+                logger.info(
+                    "Loading Whisper model=%s device=%s compute=%s",
+                    WHISPER_MODEL,
+                    WHISPER_DEVICE,
+                    WHISPER_COMPUTE,
+                )
+                _whisper_model = WhisperModel(
+                    WHISPER_MODEL,
+                    device=WHISPER_DEVICE,
+                    compute_type=WHISPER_COMPUTE,
+                )
     return _whisper_model
 
 
@@ -192,6 +198,20 @@ async def transcribe_wav():
 RENDER_DIR = Path(tempfile.gettempdir()) / "audiograms"
 RENDER_DIR.mkdir(exist_ok=True)
 
+_RENDER_JOB_DIR: ContextVar[Path | None] = ContextVar("render_job_dir", default=None)
+
+
+def _write_render_debug_file(name: str, content: str) -> None:
+    job_dir = _RENDER_JOB_DIR.get()
+    if not job_dir:
+        return
+    try:
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / name).write_text(str(content), encoding="utf-8")
+    except Exception as e:
+        logger.warning("debug file write failed name=%s error=%s", name, e)
+
+
 # Walk With Me brand palette
 _BG      = "#0D1B2A"   # deep navy
 _ACCENT  = "#E8A838"   # warm gold  (hex as int for FFmpeg drawtext: 0xE8A838)
@@ -284,10 +304,15 @@ def _make_background(title: str, scripture: str, day_label: str, out: Path) -> N
 
 def _run_ffmpeg(args: list[str]) -> subprocess.CompletedProcess:
     cmd = ["ffmpeg", "-y"] + args
-    logger.info("FFmpeg: %s", " ".join(cmd))
+    cmd_text = " ".join(cmd)
+    logger.info("FFmpeg: %s", cmd_text)
+    _write_render_debug_file("last_ffmpeg_cmd.txt", cmd_text)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=360)
+    _write_render_debug_file("last_ffmpeg_stdout.log", result.stdout or "")
+    _write_render_debug_file("last_ffmpeg_stderr.log", result.stderr or "")
     if result.returncode != 0:
-        raise RuntimeError(result.stderr[-3000:])
+        tail = (result.stderr or result.stdout or "")[-8000:]
+        raise RuntimeError(f"FFmpeg failed (see last_ffmpeg_stderr.log):\n{tail}")
     return result
 
 
@@ -340,6 +365,7 @@ async def render_audiogram(
     job_id  = uuid.uuid4().hex[:12]
     job_dir = RENDER_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+    job_token = _RENDER_JOB_DIR.set(job_dir)
 
     audio_path = job_dir / "input.mp3"
     bg_path    = job_dir / "background.png"
@@ -414,11 +440,10 @@ async def render_audiogram(
         logger.error("Audiogram job %s — unexpected error: %s", job_id, e)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        _RENDER_JOB_DIR.reset(job_token)
         # Clean up job folder after response is sent
         # (FileResponse streams before this runs, so the file is safe)
-        import threading
         def _cleanup():
-            import time
             time.sleep(60)          # keep for 60 s in case of retries
             shutil.rmtree(job_dir, ignore_errors=True)
         threading.Thread(target=_cleanup, daemon=True).start()
@@ -471,25 +496,244 @@ def _download_file(url: str, dest: Path, timeout: int = 30) -> bool:
         return False
 
 
-def _generate_srt(audio_path: Path, job_dir: Path) -> Path | None:
-    """Run Whisper on audio and write a properly formatted SRT file."""
+
+
+def _seconds_to_ass_time(s: float) -> str:
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = int(s % 60)
+    cs = int(round((s % 1) * 100))
+    if cs >= 100:
+        sec += 1
+        cs = 0
+    return f"{h:d}:{m:02d}:{sec:02d}.{cs:02d}"
+
+
+def _normalize_caption_mode(mode: str, fallback: str = "phrase_safe") -> str:
+    mode = str(mode or fallback).strip().lower()
+    allowed = {"phrase_safe", "pop_word", "karaoke_dynamic", "landing_emphasis"}
+    return mode if mode in allowed else fallback
+
+
+def _caption_target_words(mode: str, max_words: int = 4) -> int:
+    max_words = max(1, int(max_words or 4))
+    if mode == "pop_word":
+        return 1
+    if mode == "landing_emphasis":
+        return min(max_words, 2)
+    if mode == "karaoke_dynamic":
+        return min(max_words, 3)
+    return min(max_words, 5)
+
+
+def _caption_min_hold(mode: str, density_hint: str = "balanced") -> float:
+    density_hint = str(density_hint or "balanced").strip().lower()
+    base = {
+        "pop_word": 0.18,
+        "landing_emphasis": 0.24,
+        "karaoke_dynamic": 0.22,
+        "phrase_safe": 0.38,
+    }.get(mode, 0.28)
+    if density_hint == "slower":
+        return base + 0.08
+    if density_hint == "faster":
+        return max(0.10, base - 0.05)
+    return base
+
+
+def _split_caption_lines(words: list[str], max_chars: int = 22, max_lines: int = 2) -> str:
+    cleaned = [str(w or "").strip() for w in words if str(w or "").strip()]
+    if not cleaned:
+        return ""
+    max_chars = max(8, int(max_chars or 22))
+    max_lines = max(1, int(max_lines or 2))
+    lines: list[str] = []
+    current = []
+    for word in cleaned:
+        candidate = (" ".join(current + [word])).strip()
+        if current and len(candidate) > max_chars and len(lines) < max_lines - 1:
+            lines.append(" ".join(current).strip())
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        lines.append(" ".join(current).strip())
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1][:max_chars].rstrip()
+    return r"\N".join(lines)
+
+
+def _extract_timed_words(segments) -> list[dict]:
+    out: list[dict] = []
+    for seg in segments:
+        words = getattr(seg, "words", None) or []
+        if words:
+            for word in words:
+                start = float(getattr(word, "start", getattr(seg, "start", 0.0)) or 0.0)
+                end = float(getattr(word, "end", start) or start)
+                token = str(getattr(word, "word", "") or "").strip()
+                if token:
+                    out.append({"start": start, "end": max(end, start + 0.02), "text": token})
+            continue
+        text = str(getattr(seg, "text", "") or "").strip()
+        if not text:
+            continue
+        tokens = [t for t in re.split(r"\s+", text) if t]
+        if not tokens:
+            continue
+        seg_start = float(getattr(seg, "start", 0.0) or 0.0)
+        seg_end = float(getattr(seg, "end", seg_start) or seg_start)
+        seg_dur = max(seg_end - seg_start, 0.06 * len(tokens))
+        step = seg_dur / max(len(tokens), 1)
+        for idx, token in enumerate(tokens):
+            start = seg_start + (idx * step)
+            end = seg_start + ((idx + 1) * step)
+            out.append({"start": start, "end": max(end, start + 0.02), "text": token})
+    return out
+
+
+def _build_caption_cues(words: list[dict], *, caption_mode: str = "phrase_safe", caption_hook_mode: str = "pop_word", caption_landing_mode: str = "landing_emphasis", max_words_per_caption: int = 4, max_chars_per_line: int = 22, max_lines: int = 2, density_hint: str = "balanced") -> list[dict]:
+    if not words:
+        return []
+    total_words = len(words)
+    hook_cutoff = max(6, int(total_words * 0.14))
+    landing_cutoff = max(6, int(total_words * 0.16))
+    cues: list[dict] = []
+    i = 0
+    while i < total_words:
+        if i < hook_cutoff:
+            mode = _normalize_caption_mode(caption_hook_mode, caption_mode)
+        elif i >= max(0, total_words - landing_cutoff):
+            mode = _normalize_caption_mode(caption_landing_mode, caption_mode)
+        else:
+            mode = _normalize_caption_mode(caption_mode)
+
+        target_words = _caption_target_words(mode, max_words_per_caption)
+        selected = []
+        j = i
+        while j < total_words:
+            candidate = selected + [words[j]]
+            candidate_text = _split_caption_lines([w["text"] for w in candidate], max_chars_per_line, max_lines)
+            if selected and (len(candidate) > target_words or candidate_text.count(r"\N") + 1 > max_lines):
+                break
+            selected = candidate
+            if len(selected) >= target_words:
+                break
+            j += 1
+            if j >= total_words:
+                break
+        if not selected:
+            selected = [words[i]]
+        start = float(selected[0]["start"])
+        end = float(selected[-1]["end"])
+        end = max(end, start + _caption_min_hold(mode, density_hint))
+        text = _split_caption_lines([w["text"] for w in selected], max_chars_per_line, max_lines)
+        if text:
+            cues.append({"start": start, "end": end, "text": text, "style": mode})
+        i += len(selected)
+
+    for idx in range(len(cues) - 1):
+        next_start = cues[idx + 1]["start"]
+        cues[idx]["end"] = min(cues[idx]["end"], max(cues[idx]["start"] + 0.06, next_start - 0.02))
+    for cue in cues:
+        cue["end"] = max(cue["end"], cue["start"] + 0.06)
+    return cues
+
+
+def _caption_margin_v(render_height: int = 1920, zone: str = "lower_third_safe", safe_margin: float = 0.12) -> int:
+    render_height = max(int(render_height or 1920), 720)
+    zone = str(zone or "lower_third_safe").strip().lower()
+    safe_margin = max(0.05, min(float(safe_margin or 0.12), 0.25))
+    if zone == "mid_low_safe":
+        return max(int(render_height * (safe_margin + 0.14)), 340 if render_height >= 1600 else 220)
+    if zone == "center_safe":
+        return 0
+    return max(int(render_height * (safe_margin + 0.09)), 260 if render_height >= 1600 else 170)
+
+
+def _caption_ass_styles(render_width: int = 1080, render_height: int = 1920, zone: str = "lower_third_safe", safe_margin: float = 0.12) -> dict[str, str]:
+    margin_lr = max(int(render_width * max(0.05, min(float(safe_margin or 0.12), 0.22))), 72)
+    margin_v = _caption_margin_v(render_height, zone, safe_margin)
+    align = "2" if str(zone or "").strip().lower() != "center_safe" else "5"
+    styles = {
+        "phrase_safe": f"Style: PhraseSafe,DejaVu Sans,{30 if render_height >= 1600 else 24},&H00FFFFFF,&H00FFFFFF,&H00000000,&H66000000,1,0,0,0,100,100,0,0,4,2.4,0,{align},{margin_lr},{margin_lr},{margin_v},1",
+        "pop_word": f"Style: PopWord,DejaVu Sans,{44 if render_height >= 1600 else 34},&H00FFFFFF,&H00FFFFFF,&H00000000,&H66000000,1,0,0,0,100,100,0,0,4,2.8,0,{align},{margin_lr},{margin_lr},{margin_v},1",
+        "karaoke_dynamic": f"Style: KaraokeDynamic,DejaVu Sans,{36 if render_height >= 1600 else 28},&H00FFFFFF,&H00FFFFFF,&H00000000,&H66000000,1,0,0,0,100,100,0,0,4,2.6,0,{align},{margin_lr},{margin_lr},{margin_v},1",
+        "landing_emphasis": f"Style: LandingEmphasis,DejaVu Sans,{48 if render_height >= 1600 else 36},&H00FFFFFF,&H00FFFFFF,&H00000000,&H66000000,1,0,0,0,100,100,0,0,4,3.0,0,{align},{margin_lr},{margin_lr},{margin_v},1",
+    }
+    return styles
+
+
+def _safe_ass_text(text: str) -> str:
+    return str(text or "").replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}").replace("\n", r"\N")
+
+
+def _generate_srt(audio_path: Path, job_dir: Path, *, caption_mode: str = "phrase_safe", caption_hook_mode: str = "pop_word", caption_landing_mode: str = "landing_emphasis", max_words_per_caption: int = 4, max_chars_per_line: int = 22, max_lines: int = 2, portrait_safe_margin: float = 0.12, caption_vertical_zone: str = "lower_third_safe", dynamic_word_emphasis: bool = True, caption_animation_level: str = "medium", caption_density_hint: str = "balanced", render_width: int = 1080, render_height: int = 1920) -> Path | None:
+    """Run Whisper on audio and write portrait-safe ASS subtitles for social video."""
     try:
         model = get_whisper()
-        segments, _ = model.transcribe(
-            str(audio_path), beam_size=5, vad_filter=True,
-        )
-        srt_lines = []
-        for i, seg in enumerate(segments, 1):
-            start = _seconds_to_srt_time(seg.start)
-            end   = _seconds_to_srt_time(seg.end)
-            text  = seg.text.strip()
-            if text:
-                srt_lines.append(f"{i}\n{start} --> {end}\n{text}\n")
-        if not srt_lines:
+        try:
+            segments, _ = model.transcribe(
+                str(audio_path), beam_size=5, vad_filter=True, word_timestamps=True,
+            )
+        except TypeError:
+            segments, _ = model.transcribe(
+                str(audio_path), beam_size=5, vad_filter=True,
+            )
+
+        timed_words = _extract_timed_words(segments)
+        if not timed_words:
             return None
-        srt_path = job_dir / "captions.srt"
-        srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
-        return srt_path
+
+        if not dynamic_word_emphasis and caption_mode == "pop_word":
+            caption_mode = "phrase_safe"
+
+        cues = _build_caption_cues(
+            timed_words,
+            caption_mode=_normalize_caption_mode(caption_mode),
+            caption_hook_mode=_normalize_caption_mode(caption_hook_mode, "pop_word"),
+            caption_landing_mode=_normalize_caption_mode(caption_landing_mode, "landing_emphasis"),
+            max_words_per_caption=max_words_per_caption,
+            max_chars_per_line=max_chars_per_line,
+            max_lines=max_lines,
+            density_hint=caption_density_hint,
+        )
+        if not cues:
+            return None
+
+        styles = _caption_ass_styles(render_width, render_height, caption_vertical_zone, portrait_safe_margin)
+        ass_path = job_dir / "captions.ass"
+        lines = [
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            f"PlayResX: {render_width}",
+            f"PlayResY: {render_height}",
+            "ScaledBorderAndShadow: yes",
+            "WrapStyle: 2",
+            "",
+            "[V4+ Styles]",
+            "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
+            styles["phrase_safe"],
+            styles["pop_word"],
+            styles["karaoke_dynamic"],
+            styles["landing_emphasis"],
+            "",
+            "[Events]",
+            "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
+        ]
+        style_map = {
+            "phrase_safe": "PhraseSafe",
+            "pop_word": "PopWord",
+            "karaoke_dynamic": "KaraokeDynamic",
+            "landing_emphasis": "LandingEmphasis",
+        }
+        for cue in cues:
+            lines.append(
+                f"Dialogue: 0,{_seconds_to_ass_time(cue['start'])},{_seconds_to_ass_time(cue['end'])},{style_map.get(cue['style'], 'PhraseSafe')},,0,0,0,,{_safe_ass_text(cue['text'])}"
+            )
+        ass_path.write_text("\n".join(lines), encoding="utf-8")
+        return ass_path
     except Exception as e:
         logger.warning("SRT generation failed: %s", e)
         return None
@@ -666,6 +910,7 @@ def _resolve_ambient_layer(raw_layer, *, default_volume: float, default_ducking:
     else:
         payload = raw_layer.model_dump()
 
+    local_path = str(payload.get("local_path") or payload.get("path") or "").strip()
     url = _coerce_public_storage_url(
         payload.get("url")
         or payload.get("src")
@@ -674,7 +919,7 @@ def _resolve_ambient_layer(raw_layer, *, default_volume: float, default_ducking:
         or payload.get("gcs_uri")
         or payload.get("gcs_url")
     )
-    if not url:
+    if not url and not local_path:
         return None
 
     def pick(key: str, fallback):
@@ -684,6 +929,7 @@ def _resolve_ambient_layer(raw_layer, *, default_volume: float, default_ducking:
     return {
         "name": str(payload.get("name") or default_name),
         "url": url,
+        "local_path": local_path,
         "volume": _coerce_float(pick("volume", default_volume), default_volume),
         "ducking": _coerce_bool(pick("ducking", default_ducking), default_ducking),
         "duck_threshold": _coerce_float(pick("duck_threshold", default_threshold), default_threshold),
@@ -704,6 +950,7 @@ def _prepare_ambient_layers(job_dir: Path, body) -> list[dict]:
             "name": "music",
             "url": body.ambient_music_url,
             "music_gcs_uri": body.music_gcs_uri,
+            "local_path": body.music_local_path,
             "volume": body.ambient_volume,
             "ducking": body.ambient_ducking,
             "duck_threshold": body.ambient_duck_threshold,
@@ -711,6 +958,7 @@ def _prepare_ambient_layers(job_dir: Path, body) -> list[dict]:
             "duck_attack": body.ambient_duck_attack,
             "duck_release": body.ambient_duck_release,
             "duck_makeup": body.ambient_duck_makeup,
+            "fade_out": body.music_fade_out_seconds,
         },
         default_volume=body.ambient_volume,
         default_ducking=body.ambient_ducking,
@@ -741,11 +989,12 @@ def _prepare_ambient_layers(job_dir: Path, body) -> list[dict]:
 
     prepared_layers: list[dict] = []
     for idx, layer in enumerate(layers):
-        ext = Path(layer["url"].split("?", 1)[0]).suffix or ".mp3"
+        source_hint = layer.get("local_path") or layer.get("url") or ""
+        ext = Path(str(source_hint).split("?", 1)[0]).suffix or ".mp3"
         slug = re.sub(r"[^a-z0-9_-]+", "_", str(layer["name"]).lower()).strip("_") or f"ambient_{idx + 1}"
         path = job_dir / f"ambient_{idx + 1:02d}_{slug}{ext}"
-        if not _download_file(layer["url"], path):
-            logger.warning("ambient layer download failed name=%s url=%s", layer["name"], layer["url"])
+        if not _stage_ambient_layer_asset(layer, path):
+            logger.warning("ambient layer fetch failed name=%s src=%s", layer["name"], source_hint)
             continue
         if not path.exists() or path.stat().st_size == 0:
             logger.warning("ambient layer empty name=%s url=%s", layer["name"], layer["url"])
@@ -758,7 +1007,7 @@ def _prepare_ambient_layers(job_dir: Path, body) -> list[dict]:
 
 
 def _srt_force_style(style: str = "bottom") -> str:
-    """Return an ASS/SRT force_style string for the subtitles FFmpeg filter."""
+    """Return an ASS/SRT force_style string for simple subtitle rendering."""
     base = (
         "FontName=DejaVu Sans,FontSize=28,Bold=1,"
         "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
@@ -769,7 +1018,16 @@ def _srt_force_style(style: str = "bottom") -> str:
         return base.replace("Alignment=2", "Alignment=5").replace("MarginV=60", "MarginV=0")
     if style == "top":
         return base.replace("Alignment=2", "Alignment=8").replace("MarginV=60", "MarginV=80")
-    return base   # default: bottom, Alignment=2
+    return base
+
+
+def _subtitle_filter_clause(sub_path: Path, force_style: str = "") -> str:
+    sub_escaped = str(sub_path).replace("\\", "/").replace(":", "\\:")
+    if sub_path.suffix.lower() == ".ass":
+        return f"subtitles='{sub_escaped}'"
+    if force_style:
+        return f"subtitles='{sub_escaped}':force_style='{force_style}'"
+    return f"subtitles='{sub_escaped}'"
 
 
 # ── Format renderers ───────────────────────────────────────────────────────────
@@ -923,7 +1181,7 @@ def _fmt_scripture_cards(audio: Path, bg: Path, scripture: str,
 
     # Escape special chars for FFmpeg drawtext
     def esc(t: str) -> str:
-        return t.replace("'", "\\'").replace(":", "\\:").replace("\\", "\\\\")
+            return str(t).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
     title_safe  = esc(title[:60])
     scrip_safe  = esc(scripture[:120])
@@ -1032,6 +1290,7 @@ async def render_dynamic(
     job_id  = uuid.uuid4().hex[:12]
     job_dir = RENDER_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+    job_token = _RENDER_JOB_DIR.set(job_dir)
     logger.info("render-dynamic job=%s format=%s", job_id, video_format)
 
     preset_map = {"fast": "ultrafast", "medium": "fast", "hq": "slow"}
@@ -1155,9 +1414,9 @@ async def render_dynamic(
         logger.error("job=%s unexpected: %s", job_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        import threading
+        _RENDER_JOB_DIR.reset(job_token)
         def _cleanup():
-            import time; time.sleep(90)
+            time.sleep(90)
             shutil.rmtree(job_dir, ignore_errors=True)
         threading.Thread(target=_cleanup, daemon=True).start()
 
@@ -1171,6 +1430,9 @@ class PodcastTurn(BaseModel):
     turn_index: int = Field(0, description="0-based order in the conversation")
     speaker_id: str = Field("SPEAKER_1", description="Speaker id for this turn")
     url: str = Field("", description="Public URL for the rendered turn audio")
+    gcs_uri: str = Field("", description="Optional gs:// URI for the rendered turn audio")
+    object_path: str = Field("", description="Optional object path for the rendered turn audio")
+    local_path: str = Field("", description="Optional local filesystem path for the rendered turn audio")
     text: str = Field("", description="Turn text, used only for logging/debug")
     voice_energy: str = Field("anchor", description="Energy label from the voice writer")
     estimated_duration: float = Field(0.0, description="n8n-side duration estimate in seconds")
@@ -1186,6 +1448,7 @@ class AmbientFxLayer(BaseModel):
     music_gcs_uri: str = Field("", description="Alternate gs:// field")
     gcs_uri: str = Field("", description="Alternate gs:// field")
     gcs_url: str = Field("", description="Alternate public URL field")
+    local_path: str = Field("", description="Optional local filesystem path")
     volume: float | None = Field(None, description="Layer volume 0.0-1.0")
     ducking: bool | None = Field(None, description="Whether to duck this layer under dialogue")
     duck_threshold: float | None = Field(None, description="Optional per-layer duck threshold")
@@ -1198,9 +1461,27 @@ class AmbientFxLayer(BaseModel):
 
 
 class PodcastRenderRequest(BaseModel):
-    bg_loop_url:        str   = Field(...,  description="GCS URL of background loop video")
+    bg_loop_url:        str   = Field("",  description="Public URL of background loop video")
+    bg_loop_gcs_uri:    str   = Field("",  description="Optional gs:// background loop fallback")
+    bg_object_path:     str   = Field("",  description="Optional bucket object path for the background loop")
+    background_local_path: str = Field("", description="Optional local filesystem path to the background loop video")
+    background_local_paths: list[str] = Field(
+        default_factory=list,
+        description="Optional list of local background videos to rotate through during the episode",
+    )
+    media_sequence: list[dict] = Field(
+        default_factory=list,
+        description="Optional ordered media sequence for local-first backgrounds",
+    )
+    outro_image_local_path: str = Field("", description="Optional local filesystem path to the branded outro image")
+    outro_duration: float = Field(4.0, description="How long the outro card should hold, in seconds")
+    outro_fade_duration: float = Field(1.2, description="Crossfade duration into the outro card, in seconds")
     host_audio_url:     str   = Field("",   description="GCS URL of host MP3 (empty when speaker_audio used)")
+    host_audio_gcs_uri: str   = Field("",   description="Optional gs:// host audio fallback")
+    host_audio_local_path: str = Field("", description="Optional local filesystem path for host audio")
     reflection_audio_url: str = Field("",   description="GCS URL of reflection MP3 (optional)")
+    reflection_audio_gcs_uri: str = Field("", description="Optional gs:// reflection audio fallback")
+    reflection_audio_local_path: str = Field("", description="Optional local filesystem path for reflection audio")
     # Multi-speaker fields sent by n8n Cast TTS node
     speaker_audio:      dict  = Field(default_factory=dict, description="SPEAKER_1..N dict from Cast TTS")
     full_turns:         list[PodcastTurn] = Field(default_factory=list, description="Full episode turn clips in playback order")
@@ -1210,10 +1491,25 @@ class PodcastRenderRequest(BaseModel):
     render_style:       str   = Field("speaker_fallback", description="interleaved_dialogue | speaker_fallback")
     turn_scope:         str   = Field("full", description="Prefer full or short turns when both are present")
     cast_size:          int   = Field(0,    description="Number of speakers (0 = derive from speaker_audio)")
+    local_asset_preferred: bool = Field(False, description="Prefer local filesystem assets when available")
     run_id:             str   = Field("",   description="Episode run_id from n8n")
+    media_temp_root:    str   = Field(
+        "/mnt/HC_Volume_105210642/temp_runs",
+        description="Root temp directory for run-scoped staging (paths derived for n8n)",
+    )
+    run_root:           str   = Field("",   description="Derived run root directory")
+    audio_root:         str   = Field("",   description="Derived audio root directory")
+    full_audio_root:    str   = Field("",   description="Derived full-audio directory")
+    short_audio_root:   str   = Field("",   description="Derived short-audio directory")
+    video_root:         str   = Field("",   description="Derived video output directory")
+    clips_root:         str   = Field("",   description="Derived clips directory")
     episode_title:      str   = Field("",   description="Alias for title (n8n sends episode_title)")
     ambient_music_url:  str   = Field("",  description="GCS URL or Pixabay URL of ambient music bed")
     music_gcs_uri:      str   = Field("",  description="Legacy gs:// music URI fallback")
+    music_local_path:   str   = Field("",  description="Optional local filesystem path to ambient music")
+    ambient_source_mode: str  = Field("bucket", description="bucket | local | remote")
+    ambient_scene_hint: str   = Field("", description="Optional scene hint for ambient search/selection")
+    ambient_search_terms: list[str] = Field(default_factory=list, description="Optional ambient search terms")
     ambient_fx_layers:  list[AmbientFxLayer | str] = Field(default_factory=list, description="Optional extra ambient FX layers such as birds or water")
     host_duration:      float = Field(0,   description="Host audio duration in seconds (0 = auto-detect)")
     reflection_duration: float = Field(0,  description="Reflection audio duration in seconds (0 = auto-detect)")
@@ -1225,10 +1521,156 @@ class PodcastRenderRequest(BaseModel):
     ambient_duck_attack: float = Field(20.0, description="Attack time in ms for ducking")
     ambient_duck_release: float = Field(280.0, description="Release time in ms for ducking")
     ambient_duck_makeup: float = Field(1.0, description="Makeup gain after ducking compression")
+    music_fade_out_seconds: float = Field(
+        2.5,
+        description="Fade-out duration applied to the primary music bed at the end",
+    )
     aspect_ratio:       str   = Field("9:16", description="'9:16' (Reels/Shorts) or '16:9' (YouTube)")
     title:              str   = Field("",  description="Episode title for drawtext overlay")
     scripture:          str   = Field("",  description="Scripture reference for drawtext overlay")
     quality:            str   = Field("medium", description="fast | medium | hq")
+    show_title:         bool  = Field(True, description="Burn episode title into the video")
+    show_subtitles:     bool  = Field(True, description="Auto-generate and burn subtitles")
+    audio_visual_style: str   = Field("waveform", description="waveform | spectrum | none")
+    caption_style:      str   = Field("bottom", description="bottom | center | top")
+    single_speaker_mode: bool = Field(False, description="When true, never synthesize or stitch a reflection track")
+    caption_mode:       str   = Field("phrase_safe", description="phrase_safe | pop_word | karaoke_dynamic | landing_emphasis")
+    caption_hook_mode:  str   = Field("pop_word", description="Caption mode for the opening hook")
+    caption_landing_mode: str = Field("landing_emphasis", description="Caption mode for the close or landing line")
+    max_words_per_caption: int = Field(4, description="Hard cap for words per caption chunk")
+    max_chars_per_line: int = Field(22, description="Hard cap for characters per caption line in portrait")
+    max_lines:          int   = Field(2, description="Maximum visible caption lines")
+    portrait_safe_margin: float = Field(0.12, description="Side safe margin for portrait subtitles")
+    caption_vertical_zone: str = Field("lower_third_safe", description="lower_third_safe | mid_low_safe | center_safe")
+    dynamic_word_emphasis: bool = Field(True, description="Prefer denser, punchier word timing when available")
+    caption_animation_level: str = Field("medium", description="low | medium | high")
+    caption_density_hint: str = Field("balanced", description="slower | balanced | faster")
+
+
+def _stage_local_or_remote_asset(source_url: str, dest_path: Path, *, local_path: str = "") -> bool:
+    local = str(local_path or "").strip()
+    if local:
+        try:
+            src = Path(local)
+            if src.exists() and src.is_file():
+                shutil.copyfile(src, dest_path)
+                return dest_path.exists() and dest_path.stat().st_size > 0
+        except Exception as e:
+            logger.warning("local asset copy failed path=%s error=%s", local, e)
+    source_url = str(source_url or "").strip()
+    if not source_url:
+        return False
+    return _download_file(source_url, dest_path)
+
+
+def _stage_ambient_layer_asset(layer: dict, dest_path: Path) -> bool:
+    local = str(layer.get("local_path") or "").strip()
+    if local:
+        try:
+            src = Path(local)
+            if src.exists() and src.is_file():
+                shutil.copyfile(src, dest_path)
+                return dest_path.exists() and dest_path.stat().st_size > 0
+        except Exception as e:
+            logger.warning("ambient local copy failed path=%s error=%s", local, e)
+    return _download_file(layer.get("url", ""), dest_path)
+
+
+def _stage_any_asset(*, dest_path: Path, local_path: str = "", gcs_uri: str = "", object_path: str = "", url: str = "") -> bool:
+    local = str(local_path or "").strip()
+    if local:
+        try:
+            src = Path(local)
+            if src.exists() and src.is_file():
+                shutil.copyfile(src, dest_path)
+                return dest_path.exists() and dest_path.stat().st_size > 0
+        except Exception as e:
+            logger.warning("local asset copy failed path=%s error=%s", local, e)
+    remote = str(url or "").strip()
+    if not remote:
+        remote = _coerce_public_storage_url(gcs_uri or object_path)
+    if not remote:
+        return False
+    return _download_file(remote, dest_path)
+
+
+def _speaker_scope_value(entry: dict, scope: str, key: str) -> str:
+    return str(
+        entry.get(f"{scope}_{key}")
+        or entry.get(key)
+        or ""
+    ).strip()
+
+
+def _has_speaker_scope_source(entry: dict, scope: str = "full") -> bool:
+    return bool(
+        _speaker_scope_value(entry, scope, "local_path")
+        or _speaker_scope_value(entry, scope, "gcs_uri")
+        or _speaker_scope_value(entry, scope, "object_path")
+        or _speaker_scope_value(entry, scope, "url")
+    )
+
+
+def _build_background_sequence(
+    local_paths: list[str], total: float, job_dir: Path, W: int, H: int, preset: str
+) -> Path | None:
+    """Concatenate multiple local background clips into one loopable segment for the episode."""
+    unique_paths: list[Path] = []
+    seen: set[str] = set()
+    for raw in local_paths or []:
+        p = str(raw or "").strip()
+        if not p or p in seen:
+            continue
+        path = Path(p)
+        if path.exists() and path.is_file():
+            unique_paths.append(path)
+            seen.add(p)
+    if len(unique_paths) <= 1:
+        return None
+
+    seg_dur = max(float(total or 0.0) / max(len(unique_paths), 1), 3.0)
+    inputs: list[str] = []
+    filter_parts: list[str] = []
+    concat_inputs: list[str] = []
+    for idx, src in enumerate(unique_paths):
+        staged = job_dir / f"bg_src_{idx}{src.suffix.lower() or '.mp4'}"
+        try:
+            shutil.copyfile(src, staged)
+        except OSError:
+            staged = src
+        inputs += ["-stream_loop", "-1", "-t", f"{seg_dur:.2f}", "-i", str(staged)]
+        filter_parts.append(
+            f"[{idx}:v]fps=30,scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},{_WWM_VIDEO_SHARPEN},setpts=PTS-STARTPTS,trim=duration={seg_dur:.2f}[v{idx}]"
+        )
+        concat_inputs.append(f"[v{idx}]")
+
+    filter_parts.append(
+        f"{''.join(concat_inputs)}concat=n={len(unique_paths)}:v=1:a=0[bgout]"
+    )
+    out_path = job_dir / "bg_sequence.mp4"
+    _run_ffmpeg(
+        inputs
+        + [
+            "-filter_complex",
+            ";".join(filter_parts),
+            "-map",
+            "[bgout]",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-t",
+            f"{total:.2f}",
+            str(out_path),
+        ]
+    )
+    return out_path if out_path.exists() and out_path.stat().st_size > 0 else None
 
 
 @app.post("/render-podcast")
@@ -1243,10 +1685,37 @@ async def render_podcast(body: PodcastRenderRequest):
       timeline.tracks[1] = host audio + reflection audio
       timeline.soundtrack = ambient music bed at low volume with fade in/out
     """
+    media_temp_root = body.media_temp_root or "/mnt/HC_Volume_105210642/temp_runs"
+    run_id = (body.run_id or "").strip() or uuid.uuid4().hex[:12]
+    run_root = body.run_root or os.path.join(media_temp_root, run_id)
+    audio_root = body.audio_root or os.path.join(run_root, "audio")
+    full_audio_root = body.full_audio_root or os.path.join(audio_root, "full")
+    short_audio_root = body.short_audio_root or os.path.join(audio_root, "short")
+    video_root = body.video_root or os.path.join(run_root, "video")
+    clips_root = body.clips_root or os.path.join(run_root, "clips")
+    os.makedirs(run_root, exist_ok=True)
+    os.makedirs(audio_root, exist_ok=True)
+    os.makedirs(full_audio_root, exist_ok=True)
+    os.makedirs(short_audio_root, exist_ok=True)
+    os.makedirs(video_root, exist_ok=True)
+    os.makedirs(clips_root, exist_ok=True)
+    body = body.model_copy(
+        update={
+            "run_root": run_root,
+            "audio_root": audio_root,
+            "full_audio_root": full_audio_root,
+            "short_audio_root": short_audio_root,
+            "video_root": video_root,
+            "clips_root": clips_root,
+            "run_id": run_id,
+        }
+    )
+
     job_id  = uuid.uuid4().hex[:12]
     job_dir = RENDER_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("render-podcast job=%s", job_id)
+    render_ok = False
+    logger.info("render-podcast job=%s run_id=%s", job_id, body.run_id)
 
     preset_map = {"fast": "ultrafast", "medium": "fast", "hq": "slow"}
     preset = preset_map.get(body.quality, "fast")
@@ -1257,7 +1726,30 @@ async def render_podcast(body: PodcastRenderRequest):
     else:
         W, H = 1920, 1080
 
+    single_speaker = bool(body.single_speaker_mode) or int(body.cast_size or 0) <= 1
+    if single_speaker:
+        pruned_audio = {}
+        if isinstance(body.speaker_audio, dict) and "SPEAKER_1" in body.speaker_audio:
+            pruned_audio = {"SPEAKER_1": body.speaker_audio["SPEAKER_1"]}
+        filtered_full_turns = [turn for turn in body.full_turns if str(turn.speaker_id or "SPEAKER_1").upper() == "SPEAKER_1"] or body.full_turns
+        filtered_short_turns = [turn for turn in body.short_turns if str(turn.speaker_id or "SPEAKER_1").upper() == "SPEAKER_1"] or body.short_turns
+        body = body.model_copy(update={
+            "speaker_audio": pruned_audio,
+            "reflection_audio_url": "",
+            "reflection_audio_gcs_uri": "",
+            "reflection_audio_local_path": "",
+            "full_turns": filtered_full_turns,
+            "short_turns": filtered_short_turns,
+            "cast_size": 1,
+        })
+
+    job_token = _RENDER_JOB_DIR.set(job_dir)
     try:
+        try:
+            _write_render_debug_file("request.json", body.model_dump_json(indent=2))
+        except Exception:
+            pass
+
         # ── Download all assets ────────────────────────────────────────────────
         bg_path   = job_dir / "bg_loop.mp4"
         host_path = job_dir / "host.mp3"
@@ -1267,9 +1759,10 @@ async def render_podcast(body: PodcastRenderRequest):
         # Resolve effective title — n8n sends episode_title, model field is title
         effective_title = body.title or body.episode_title
 
-        # ── Download background loop ─────────────────────────────────────────
-        if not _download_file(body.bg_loop_url, bg_path):
-            raise HTTPException(400, "Could not download background loop video")
+        # ── Stage background loop (local path first, then remote URL) ───────
+        bg_source_url = body.bg_loop_url or _coerce_public_storage_url(body.bg_loop_gcs_uri or body.bg_object_path)
+        if not _stage_local_or_remote_asset(bg_source_url, bg_path, local_path=body.background_local_path):
+            raise HTTPException(400, "Could not stage background loop video")
 
         def select_turns() -> list[PodcastTurn]:
             preferred = str(body.turn_scope or "full").lower().strip()
@@ -1295,11 +1788,18 @@ async def render_podcast(body: PodcastRenderRequest):
             downloaded_turns = 0
 
             for local_index, turn in enumerate(selected_turns):
-                if not turn.url.strip():
+                turn_source_hint = turn.url or turn.gcs_uri or turn.object_path or turn.local_path
+                if not turn_source_hint.strip():
                     continue
-                turn_path = job_dir / _safe_turn_filename(local_index, turn.speaker_id, turn.url)
-                if not _download_file(turn.url, turn_path):
-                    logger.warning("job=%s skipped turn %s (%s) download", job_id, turn.turn_index, turn.speaker_id)
+                turn_path = job_dir / _safe_turn_filename(local_index, turn.speaker_id, turn_source_hint)
+                if not _stage_any_asset(
+                    dest_path=turn_path,
+                    local_path=turn.local_path,
+                    gcs_uri=turn.gcs_uri,
+                    object_path=turn.object_path,
+                    url=turn.url,
+                ):
+                    logger.warning("job=%s skipped turn %s (%s) stage", job_id, turn.turn_index, turn.speaker_id)
                     continue
 
                 duration = _measure_or_estimate_duration(turn_path, turn.estimated_duration)
@@ -1330,7 +1830,10 @@ async def render_podcast(body: PodcastRenderRequest):
                 )
                 dialogue_label = "dialogue"
             else:
-                dialogue_label = mix_labels[0].strip("[]")
+                single_label = mix_labels[0].strip("[]")
+                if single_label != "dialogue":
+                    turn_filters.append(f"[{single_label}]anull[dialogue]")
+                dialogue_label = "dialogue"
 
             audio_map_label = f"[{dialogue_label}]"
             if has_ambient:
@@ -1370,21 +1873,34 @@ async def render_podcast(body: PodcastRenderRequest):
         # ── Speaker fallback: flatten one file per speaker in fixed order ────
         # This keeps older workflows working, but it does not preserve turn order.
         elif body.speaker_audio:
-            SPEAKER_ORDER = ["SPEAKER_1", "SPEAKER_2", "SPEAKER_3", "SPEAKER_4", "SPEAKER_GIRL"]
-            spk_urls = [
-                body.speaker_audio[k]["full_url"]
-                for k in SPEAKER_ORDER
-                if k in body.speaker_audio and body.speaker_audio[k].get("full_url")
+            SPEAKER_ORDER = ["SPEAKER_1"] if single_speaker else [
+                "SPEAKER_1",
+                "SPEAKER_2",
+                "SPEAKER_3",
+                "SPEAKER_4",
+                "SPEAKER_GIRL",
+                "SPEAKER_GIRL_2",
             ]
-            if not spk_urls:
-                raise HTTPException(400, "speaker_audio present but no full_url entries found")
+            spk_entries = [
+                body.speaker_audio[k]
+                for k in SPEAKER_ORDER
+                if k in body.speaker_audio and _has_speaker_scope_source(body.speaker_audio[k], "full")
+            ]
+            if not spk_entries:
+                raise HTTPException(400, "speaker_audio present but no usable full speaker sources found")
             spk_paths = []
-            for idx, url in enumerate(spk_urls):
+            for idx, entry in enumerate(spk_entries):
                 p = job_dir / f"spk_{idx}.mp3"
-                if _download_file(url, p):
+                if _stage_any_asset(
+                    dest_path=p,
+                    local_path=_speaker_scope_value(entry, "full", "local_path"),
+                    gcs_uri=_speaker_scope_value(entry, "full", "gcs_uri"),
+                    object_path=_speaker_scope_value(entry, "full", "object_path"),
+                    url=_speaker_scope_value(entry, "full", "url"),
+                ):
                     spk_paths.append(p)
             if not spk_paths:
-                raise HTTPException(502, "Failed to download any speaker audio files")
+                raise HTTPException(502, "Failed to stage any speaker audio files")
             if len(spk_paths) == 1:
                 import shutil as _sh2; _sh2.copy(str(spk_paths[0]), str(host_path))
             else:
@@ -1406,18 +1922,31 @@ async def render_podcast(body: PodcastRenderRequest):
             logger.info("job=%s multi-speaker concat: %d tracks -> host.mp3", job_id, len(spk_paths))
 
         # ── Legacy 2-track path ──────────────────────────────────────────────
-        elif body.host_audio_url:
-            if not _download_file(body.host_audio_url, host_path):
-                raise HTTPException(400, "Could not download host audio")
+        elif body.host_audio_url or body.host_audio_local_path or body.host_audio_gcs_uri:
+            if not _stage_any_asset(
+                dest_path=host_path,
+                local_path=body.host_audio_local_path,
+                gcs_uri=body.host_audio_gcs_uri,
+                url=body.host_audio_url,
+            ):
+                raise HTTPException(400, "Could not stage host audio")
         else:
             raise HTTPException(400, "Provide full_turns/short_turns, speaker_audio, or host_audio_url")
 
         if not selected_turns:
-            has_reflection = bool(body.reflection_audio_url.strip())
+            has_reflection = any([
+                str(body.reflection_audio_url or "").strip(),
+                str(body.reflection_audio_local_path or "").strip(),
+                str(body.reflection_audio_gcs_uri or "").strip(),
+            ])
 
             if has_reflection:
-                _download_file(body.reflection_audio_url, refl_path)
-                has_reflection = refl_path.exists() and refl_path.stat().st_size > 0
+                has_reflection = _stage_any_asset(
+                    dest_path=refl_path,
+                    local_path=body.reflection_audio_local_path,
+                    gcs_uri=body.reflection_audio_gcs_uri,
+                    url=body.reflection_audio_url,
+                )
 
             # ── Measure durations ─────────────────────────────────────────────
             host_dur = body.host_duration or _get_audio_duration(host_path)
@@ -1449,7 +1978,8 @@ async def render_podcast(body: PodcastRenderRequest):
                 )
                 dialogue_label = "dialogue"
             else:
-                dialogue_label = "host"
+                audio_fc_parts.append("[host]anull[dialogue]")
+                dialogue_label = "dialogue"
 
             audio_map_label = f"[{dialogue_label}]"
             if has_ambient:
@@ -1479,51 +2009,150 @@ async def render_podcast(body: PodcastRenderRequest):
         # ── Pass 2: normalize the mixed audio ────────────────────────────────
         normed_path = _prenorm_audio(mixed_path, job_dir / "normed.aac")
 
-        # ── Pass 3: video render with pre-normed audio (no loudnorm in graph) ─
+        # ── Optional subtitles from the mixed dialogue/program audio ───────
+        srt_path: Path | None = None
+        if body.show_subtitles:
+            try:
+                srt_path = _generate_srt(
+                    mixed_path,
+                    job_dir,
+                    caption_mode=body.caption_mode,
+                    caption_hook_mode=body.caption_hook_mode,
+                    caption_landing_mode=body.caption_landing_mode,
+                    max_words_per_caption=body.max_words_per_caption,
+                    max_chars_per_line=body.max_chars_per_line,
+                    max_lines=body.max_lines,
+                    portrait_safe_margin=body.portrait_safe_margin,
+                    caption_vertical_zone=body.caption_vertical_zone,
+                    dynamic_word_emphasis=body.dynamic_word_emphasis,
+                    caption_animation_level=body.caption_animation_level,
+                    caption_density_hint=body.caption_density_hint,
+                    render_width=W,
+                    render_height=H,
+                )
+            except Exception as e:
+                logger.warning("job=%s subtitle generation failed: %s", job_id, e)
+                srt_path = None
+
+        # ── Rotating backgrounds: use synthesized sequence when multiple locals exist ─
+        bg_sequence_path = _build_background_sequence(
+            body.background_local_paths, total, job_dir, W, H, preset
+        )
+        effective_bg_path = bg_sequence_path or bg_path
+
+        # ── Pass 3: video render with pre-normed audio (waveform + captions) ─
         inputs = [
-            "-stream_loop", "-1", "-t", f"{total:.2f}", "-i", str(bg_path),   # 0: bg video
-            "-i", str(normed_path),                                             # 1: normed audio
+            "-stream_loop",
+            "-1",
+            "-t",
+            f"{total:.2f}",
+            "-i",
+            str(effective_bg_path),
+            "-i",
+            str(normed_path),
         ]
 
-        # ── Build filter_complex (video only) ────────────────────────────────
-        # Video: scale bg loop to fit frame, slow Ken Burns zoom in + light sharpen
-        video_filter = (
-            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
-            f"crop={W}:{H},{_WWM_VIDEO_SHARPEN},"
-            f"zoompan=z='min(zoom+0.0003,1.05)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-            f":d={int(total*30)}:s={W}x{H}:fps=30[bgvid]"
-        )
+        wave_h = 220 if H >= 1600 else max(140, int(H * 0.18))
+        wave_top = H - wave_h - 220 if H >= 1600 else H - wave_h - 140
+        title_y = 140 if H >= 1600 else 80
+        scripture_y = H - 120 if H >= 1600 else H - 80
 
-        # Optional text overlays (episode title top, scripture bottom)
+        # Still image → Ken Burns zoom; real video → preserve motion (avoid zoompan freeze bug).
+        bg_is_still = effective_bg_path.suffix.lower() in {
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp",
+            ".bmp",
+        }
+        if bg_is_still:
+            video_filter = (
+                f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+                f"crop={W}:{H},{_WWM_VIDEO_SHARPEN},"
+                f"zoompan=z='min(zoom+0.0003,1.05)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+                f":d={int(total * 30)}:s={W}x{H}:fps=30[bgvid]"
+            )
+        else:
+            video_filter = (
+                f"[0:v]fps=30,"
+                f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+                f"crop={W}:{H},"
+                f"{_WWM_VIDEO_SHARPEN},"
+                f"setpts=PTS-STARTPTS[bgvid]"
+            )
+
         def esc(t: str) -> str:
-            return t.replace("'", "\\'").replace(":", "\\:").replace("\\", "\\\\")
+            return str(t).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+        filter_parts = [video_filter]
+        current_video = "bgvid"
+        current_audio = "1:a"
+
+        viz_style = str(body.audio_visual_style or "waveform").lower().strip()
+        if viz_style in ("waveform", "spectrum"):
+            if viz_style == "spectrum":
+                viz = (
+                    f"[1:a]asplit=2[a_vis][a_enc];"
+                    f"[a_vis]showspectrum=s={W}x{wave_h}:mode=combined:slide=scroll:"
+                    f"color=rainbow:scale=cbrt[viz]"
+                )
+            else:
+                viz = (
+                    f"[1:a]asplit=2[a_vis][a_enc];"
+                    f"[a_vis]showwaves=s={W}x{wave_h}:mode=cline:"
+                    f"colors=0xE8A838|0xE8A838:rate=30[viz]"
+                )
+            filter_parts.append(viz)
+            filter_parts.append(f"[{current_video}][viz]overlay=0:{wave_top}[v_wave]")
+            current_video = "v_wave"
+            current_audio = "[a_enc]"
+
+        vignette_y = int(H * 0.55)
+        vignette_h = H - vignette_y
+        filter_parts.append(
+            f"[{current_video}]drawbox=x=0:y={vignette_y}:w={W}:h={vignette_h}:color=black@0.22:t=fill,"
+            f"drawbox=x=0:y={int(H * 0.68)}:w={W}:h={H - int(H * 0.68)}:color=black@0.10:t=fill[v_vignette]"
+        )
+        current_video = "v_vignette"
 
         overlays = []
-        if effective_title:
+        if body.show_title and effective_title:
             overlays.append(
-                f"drawtext=text='{esc(effective_title[:60])}':fontsize=52:fontcolor=0xF5F0E8:"
-                f"x=(w-text_w)/2:y=140:"
-                f"alpha='if(lt(t,0.5),t/0.5,if(lt(t,{total-1:.1f}),1,max(0,1-(t-{total-1:.1f})/0.5)))'"
+                f"drawtext=text='{esc(effective_title[:60])}':fontsize=44:fontcolor=0xF5F0E8:"
+                f"x=(w-text_w)/2:y={title_y}:shadowx=0:shadowy=2:shadowcolor=black@0.55:"
+                f"alpha='if(lt(t,0.5),t/0.5,if(lt(t,3.0),1,max(0,1-(t-3.0)/0.5)))'"
             )
         if body.scripture:
+            scripture_fade_out = max(2.8, total - 0.8)
             overlays.append(
-                f"drawtext=text='{esc(body.scripture[:100])}':fontsize=36:fontcolor=0xE8A838:"
-                f"x=(w-text_w)/2:y=h-120:"
-                f"alpha='if(lt(t,1),0,if(lt(t,2),(t-1),1))'"
+                f"drawtext=text='{esc(body.scripture[:100])}':fontsize=38:fontcolor=0xE8A838:"
+                f"x=(w-text_w)/2:y={scripture_y}:shadowx=0:shadowy=2:shadowcolor=black@0.60:"
+                f"alpha='if(lt(t,0.6),0,if(lt(t,1.2),(t-0.6)/0.6,"
+                f"if(lt(t,{scripture_fade_out:.2f}),1,max(0,1-(t-{scripture_fade_out:.2f})/0.5))))'"
             )
-
         fade_v_st = max(0.0, total - 0.45)
         fade_v = f"fade=t=in:st=0:d=0.4,fade=t=out:st={fade_v_st:.2f}:d=0.45"
         if overlays:
-            video_chain = "[bgvid]" + ",".join(overlays) + f",{fade_v}[vout]"
+            filter_parts.append(f"[{current_video}]" + ",".join(overlays) + f",{fade_v}[v_text]")
+            current_video = "v_text"
         else:
-            video_chain = f"[bgvid]{fade_v}[vout]"
+            filter_parts.append(f"[{current_video}]{fade_v}[v_text]")
+            current_video = "v_text"
+
+        if srt_path:
+            fs = "" if srt_path.suffix.lower() == ".ass" else _srt_force_style(body.caption_style)
+            sub_clause = _subtitle_filter_clause(srt_path, fs)
+            filter_parts.append(f"[{current_video}]{sub_clause}[vout]")
+            current_video = "vout"
+        else:
+            filter_parts.append(f"[{current_video}]null[vout]")
+            current_video = "vout"
 
         _run_ffmpeg(
             inputs + [
-                "-filter_complex", f"{video_filter};{video_chain}",
-                "-map", "[vout]",
-                "-map", "1:a",
+                "-filter_complex", ";".join(filter_parts),
+                "-map", f"[{current_video}]",
+                "-map", current_audio,
                 "-c:v", "libx264", "-preset", preset, "-crf", "22",
                 "-c:a", "aac", "-b:a", "192k",
                 "-pix_fmt", "yuv420p",
@@ -1533,24 +2162,31 @@ async def render_podcast(body: PodcastRenderRequest):
         )
 
         logger.info("job=%s podcast render complete size=%d", job_id, out_path.stat().st_size)
+        render_ok = True
         return FileResponse(
             str(out_path), media_type="video/mp4",
             filename=f"wwm_podcast_{job_id}.mp4",
             headers={"X-Job-Id": job_id, "X-Duration": f"{total:.1f}"},
         )
 
-    except HTTPException:
+    except HTTPException as e:
+        _write_render_debug_file(
+            "http_exception.txt",
+            str(e.detail if hasattr(e, "detail") else e),
+        )
         raise
     except RuntimeError as e:
-        logger.error("job=%s podcast FFmpeg error: %s", job_id, str(e)[:500])
-        raise HTTPException(500, f"Podcast render failed: {str(e)[:400]}")
+        logger.error("job=%s podcast FFmpeg error: %s", job_id, str(e)[:1200])
+        _write_render_debug_file("render_error.txt", str(e))
+        raise HTTPException(500, f"Podcast render failed: {str(e)[:1200]}")
     except Exception as e:
         logger.error("job=%s podcast unexpected: %s", job_id, e, exc_info=True)
+        _write_render_debug_file("render_error.txt", str(e))
         raise HTTPException(500, str(e))
     finally:
-        import threading
+        _RENDER_JOB_DIR.reset(job_token)
         def _cleanup():
-            import time; time.sleep(90)
+            time.sleep(90 if render_ok else 21600)
             shutil.rmtree(job_dir, ignore_errors=True)
         threading.Thread(target=_cleanup, daemon=True).start()
 
@@ -1581,6 +2217,7 @@ async def render_video_clips(body: VideoClipsRenderRequest):
     job_id  = uuid.uuid4().hex[:12]
     job_dir = RENDER_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+    job_token = _RENDER_JOB_DIR.set(job_dir)
     logger.info("render-video-clips job=%s clips=%d", job_id, len(body.clip_urls))
 
     preset_map = {"fast": "ultrafast", "medium": "fast", "hq": "slow"}
@@ -1714,8 +2351,8 @@ async def render_video_clips(body: VideoClipsRenderRequest):
         logger.error("job=%s clips unexpected: %s", job_id, e, exc_info=True)
         raise HTTPException(500, str(e))
     finally:
-        import threading
+        _RENDER_JOB_DIR.reset(job_token)
         def _cleanup():
-            import time; time.sleep(90)
+            time.sleep(90)
             shutil.rmtree(job_dir, ignore_errors=True)
         threading.Thread(target=_cleanup, daemon=True).start()
